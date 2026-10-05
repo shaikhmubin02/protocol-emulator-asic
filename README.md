@@ -1,6 +1,6 @@
 ![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg)
 
-# emulator-asic
+# protocol-emulator-asic
 
 A small programmable protocol engine for Tiny Tapeout (IHP 130nm CMOS5L). The idea is a tiny
 CPU whose instructions read and write pins and count cycles, so protocols like UART, SPI and
