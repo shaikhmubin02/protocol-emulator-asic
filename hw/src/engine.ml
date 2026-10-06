@@ -29,6 +29,8 @@ module I = struct
     ; cfg_we : 'a
     ; cfg_addr : 'a [@bits 5]
     ; cfg_data : 'a [@bits 32]
+    ; time : 'a [@bits 32] (* the chip's cycle counter *)
+    ; ev_flags : 'a [@bits 8] (* the chip's event flags *)
     }
   [@@deriving hardcaml]
 end
@@ -43,7 +45,8 @@ module O = struct
     ; flags : 'a [@bits 3] (* T, C, Z *)
     ; sp : 'a [@bits 2]
     ; busy : 'a [@bits 8]
-    ; time : 'a [@bits 32]
+    ; flag_set : 'a [@bits 8]
+    ; flag_clr : 'a [@bits 8]
     ; inbox_count : 'a [@bits 2]
     ; outbox_count : 'a [@bits 2]
     ; outbox_head : 'a [@bits 16]
@@ -92,7 +95,9 @@ module Fab = Fabric_logic.Make (Signal)
 let n_le = 16
 
 let create (mode : Mode.t) (i : _ I.t) : _ O.t =
-  let spec = Reg_spec.create ~clock:i.clock ~reset:i.rst_n ~reset_level:Low () in
+  let cfg_spec = Reg_spec.create ~clock:i.clock ~reset:i.rst_n ~reset_level:Low () in
+  (* while run is low the engine sits in reset; program memory and config are kept *)
+  let spec = Reg_spec.override cfg_spec ~clear:~:(i.run) in
   let sram_mode, cfg_mode, init_of =
     match mode with
     | Asic -> Sram.Asic, Cfg_store.Asic, fun _ -> None
@@ -117,7 +122,6 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   and c = var 1
   and t = var 1
   and sp = var 2
-  and time = var 32
   and time_hi = var 16
   and cap = var 16
   and captured = var 1
@@ -129,7 +133,9 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let stack = Array.init 4 ~f:(fun _ -> var 8) in
   let out = Array.init 15 ~f:(fun _ -> var 1) in
   let oe = Array.init 15 ~f:(fun _ -> var 1) in
-  let evflags = Array.init 8 ~f:(fun _ -> var 1) in
+  let flag k = bit i.ev_flags k in
+  let flag_list = List.init 8 ~f:flag in
+  let time = i.time in
   let csrs = List.map Isa.Csr.writable ~f:(fun (addr, mask) -> addr, mask, var (width_of_mask mask)) in
   let csr_value addr =
     let _, _, v = List.find_exn csrs ~f:(fun (a, _, _) -> a = addr) in
@@ -162,7 +168,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
     Cfg_store.create
       cfg_mode
       ?init
-      ~spec
+      ~spec:cfg_spec
       ~we:(i.cfg_we &: (i.cfg_addr ==:. addr))
       ~d:i.cfg_data.:[width - 1, 0]
   in
@@ -229,7 +235,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let tstb_zero = ~:(mux imm6.:[3, 0] (bits_lsb a)) in
   (* ---------- conditions ---------- *)
   let jpin = read_pin (csr_value Isa.Csr.jpin) in
-  let jflag = mux (csr_value Isa.Csr.jflag) (Array.to_list (Array.map evflags ~f:(fun v -> v.value))) in
+  let jflag = mux (csr_value Isa.Csr.jflag) flag_list in
   let inbox_has = in_count.value <>:. 0 in
   let outbox_room = out_count.value <:. 2 in
   let cond =
@@ -258,8 +264,8 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
     mux
       wait_kind
       [ read_pin (f 9 5) ==: f 4 4
-      ; mux (f 2 0) (Array.to_list (Array.map evflags ~f:(fun v -> v.value))) ==: f 3 3
-      ; ~:(msb (time.value.:[15, 0] -: reg_c))
+      ; mux (f 2 0) flag_list ==: f 3 3
+      ; ~:(msb (time.:[15, 0] -: reg_c))
       ; mux
           (f 3 0)
           [ ~:(hold_v.value); rx_ready.value; tx_tick; captured.value; inbox_has ]
@@ -330,10 +336,10 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let crc_view = mux2 (csr_value Isa.Csr.crcctl).:[3, 3] (reverse crc.value) crc.value in
   let csr_read =
     let named =
-      [ Isa.Csr.time_lo, time.value.:[15, 0]
+      [ Isa.Csr.time_lo, time.:[15, 0]
       ; Isa.Csr.time_hi, time_hi.value
       ; Isa.Csr.cap, cap.value
-      ; Isa.Csr.flags, uresize (concat_lsb (Array.to_list (Array.map evflags ~f:(fun v -> v.value)))) ~width:16
+      ; Isa.Csr.flags, uresize i.ev_flags ~width:16
       ; Isa.Csr.bstat, uresize bstat ~width:16
       ; Isa.Csr.crc_lo, crc_view.:[15, 0]
       ; Isa.Csr.crc_hi, crc_view.:[31, 16]
@@ -615,7 +621,6 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   compile
     (List.concat
        [ [ pc <-- next_pc
-         ; time <-- time.value +:. 1
          ; sync1_uio <-- i.uio_in
          ; sync1_ui <-- i.ui_in
          ; sync2_uio <-- sync1_uio.value
@@ -629,17 +634,15 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
          ; when_ c_en [ c <-- c_new ]
          ; when_ wait_done [ t <-- ~:ready ]
          ; when_ (exec &: is_wait) [ if_ complete [ fails <-- zero 16 ] [ fails <-- fails.value +:. 1 ] ]
-         ; when_ (exec &: is 12 &: (caddr ==:. Isa.Csr.time_lo)) [ time_hi <-- time.value.:[31, 16] ]
+         ; when_ (exec &: is 12 &: (caddr ==:. Isa.Csr.time_lo)) [ time_hi <-- time.:[31, 16] ]
          ; when_ (exec &: is 12 &: (caddr ==:. Isa.Csr.cap)) [ captured <-- gnd ]
          ; when_
              (wait_done &: ready &: is 10 &: (wait_kind ==:. 3) &: (f 3 0 ==:. 3))
              [ captured <-- gnd ]
-         ; when_ cap_fire [ cap <-- (time.value +:. 1).:[15, 0]; captured <-- vdd ]
+         ; when_ cap_fire [ cap <-- (time +:. 1).:[15, 0]; captured <-- vdd ]
          ]
        ; List.init 4 ~f:(fun k -> when_ (exec &: is 6 &: (sp.value ==:. k)) [ stack.(k) <-- pc1 ])
        ; List.init 8 ~f:(fun k -> when_ (wb_en &: (wb_idx ==:. k)) [ regs.(k) <-- wb_val ])
-       ; List.init 8 ~f:(fun k ->
-           when_ (exec &: (sys 5 |: sys 6) &: (f 2 0 ==:. k)) [ evflags.(k) <-- sys 5 ])
        ; List.concat (List.init 15 ~f:per_pin)
        ; bit_engine_updates
        ; List.map csrs ~f:(fun (addr, mask, v) ->
@@ -663,7 +666,8 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   ; flags = concat_msb [ t.value; c.value; z.value ]
   ; sp = sp.value
   ; busy = busy.value
-  ; time = time.value
+  ; flag_set = mux2 (exec &: sys 5) (binary_to_onehot (f 2 0)) (zero 8)
+  ; flag_clr = mux2 (exec &: sys 6) (binary_to_onehot (f 2 0)) (zero 8)
   ; inbox_count = in_count.value
   ; outbox_count = out_count.value
   ; outbox_head = out_e0.value

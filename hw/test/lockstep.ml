@@ -11,15 +11,18 @@ type t =
   { sim : Sim.t
   ; i : Bits.t ref Engine.I.t
   ; o : Bits.t ref Engine.O.t
+  ; before : Bits.t ref Engine.O.t (* outputs just before the clock edge *)
   ; model : Model.t
   ; program : int array
   ; mutable cycle : int
+  ; mutable flags : int (* the chip-level flag register, kept here *)
   }
 
 let create ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) program =
   let sim = Sim.create (Engine.create (Engine.Mode.sim ~fabric ~crc_poly ~crc_init program)) in
   let i = Cyclesim.inputs sim
-  and o = Cyclesim.outputs sim in
+  and o = Cyclesim.outputs sim
+  and before = Cyclesim.outputs ~clock_edge:Before sim in
   let set r w v = r := Bits.of_int_trunc ~width:w v in
   set i.rst_n 1 1;
   set i.run 1 1;
@@ -28,7 +31,7 @@ let create ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) program =
   let model = Model.create program in
   Model.set_fabric model fabric;
   Model.set_crc model ~poly:crc_poly ~init:crc_init;
-  { sim; i; o; model; program; cycle = 0 }
+  { sim; i; o; before; model; program; cycle = 0; flags = 0 }
 ;;
 
 let get r = Bits.to_int_trunc !r
@@ -63,7 +66,7 @@ let compare_state t =
   check "sp" ~rtl:(get o.sp) ~model:m.sp;
   check "busy" ~rtl:(get o.busy) ~model:m.busy;
   check "halted" ~rtl:(get o.halted) ~model:(Bool.to_int m.halted);
-  check "time" ~rtl:(get o.time) ~model:m.time;
+  check "flags" ~rtl:t.flags ~model:(Model.read_csr m Isa.Csr.flags);
   check "inbox" ~rtl:(get o.inbox_count) ~model:(Queue.length m.to_engine);
   check "outbox" ~rtl:(get o.outbox_count) ~model:(Queue.length m.from_engine);
   check "crc" ~rtl:(get o.crc) ~model:m.be.crc;
@@ -90,8 +93,12 @@ let step ?send ?(receive = false) t (pads : Model.Pads.t) =
   set i.host_wr 1 (Bool.to_int writing);
   set i.host_data 16 (Option.value send ~default:0);
   set i.host_rd 1 (Bool.to_int reading);
+  set i.time 32 (Model.time t.model);
+  set i.ev_flags 8 t.flags;
   let rtl_read = if reading then Some (get t.o.outbox_head) else None in
   Cyclesim.cycle t.sim;
+  (* this cycle's flag requests, seen just before the edge *)
+  t.flags <- t.flags land lnot (get t.before.flag_clr) lor get t.before.flag_set;
   Model.step t.model pads;
   if writing then assert (Model.host_send t.model (Option.value_exn send));
   let model_read = if reading then Model.host_receive t.model else None in
