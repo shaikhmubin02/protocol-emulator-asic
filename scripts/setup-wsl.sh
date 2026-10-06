@@ -13,7 +13,7 @@ sudo apt-get update
 sudo apt-get install -y \
   build-essential git curl unzip pkg-config \
   python3 python3-pip python3-venv \
-  iverilog verilator yosys gtkwave \
+  iverilog verilator yosys gtkwave minisat \
   opam autoconf libgmp-dev libffi-dev
 
 echo "== python venv with cocotb =="
@@ -67,7 +67,8 @@ fi
 eval "$(opam env --switch="$SWITCH")"
 opam install -y -j 2 "dune.3.22.2+ox" rope re utop ocamlformat merlin ocaml-lsp-server \
   core.$JS core_unix.$JS ppx_jane.$JS \
-  hardcaml.$JS hardcaml_waveterm.$JS hardcaml_test_harness.$JS ppx_hardcaml.$JS
+  hardcaml.$JS hardcaml_waveterm.$JS hardcaml_test_harness.$JS ppx_hardcaml.$JS \
+  hardcaml_verify.$JS
 
 echo
 echo "Done. In new shells: source scripts/env.sh"
