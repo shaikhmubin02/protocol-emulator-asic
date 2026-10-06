@@ -117,19 +117,30 @@ def main(reader, layer_name):
         bterm = block.findBTerm(net_name)
         if bterm is None:
             continue
+        # One pin holds a box per stripe piece. Rebuild each pin with only the full-height boxes.
         kept = 0
         for bpin in list(bterm.getBPins()):
-            boxes = list(bpin.getBoxes())
-            full = all(
-                b.yMin() - die.yMin() <= margin and die.yMax() - b.yMax() <= margin for b in boxes
-            )
+            boxes = [
+                (b.getTechLayer(), b.xMin(), b.yMin(), b.xMax(), b.yMax()) for b in bpin.getBoxes()
+            ]
+            full = [
+                b for b in boxes if b[2] - die.yMin() <= margin and die.yMax() - b[4] <= margin
+            ]
+            for b in boxes:
+                if b not in full:
+                    print(f"  dropping short {net_name} pin box x {um(b[1]):.3f} y {um(b[2]):.3f}-{um(b[4]):.3f}")
+            if len(full) == len(boxes):
+                kept += len(full)
+                continue
+            status = bpin.getPlacementStatus()
+            odb.dbBPin.destroy(bpin)
             if full:
-                kept += 1
-            else:
-                b = boxes[0]
-                print(f"  removing short {net_name} pin x {um(b.xMin()):.3f} y {um(b.yMin()):.3f}-{um(b.yMax()):.3f}")
-                odb.dbBPin.destroy(bpin)
-        print(f"{net_name}: {kept} full-height pins kept")
+                new_pin = odb.dbBPin_create(bterm)
+                for layer_, x0, y0, x1, y1 in full:
+                    odb.dbBox_create(new_pin, layer_, x0, y0, x1, y1)
+                new_pin.setPlacementStatus(status)
+                kept += len(full)
+        print(f"{net_name}: {kept} full-height pin boxes kept")
         if kept == 0:
             print(f"ERROR: no full-height pin left on {net_name}", file=sys.stderr)
             failed = True
