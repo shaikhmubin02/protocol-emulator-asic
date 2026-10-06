@@ -23,6 +23,7 @@ module I = struct
     ; host_data : 'a [@bits 16]
     ; host_rd : 'a (* host takes the outbox head (only when it isn't empty) *)
     ; prog_we : 'a
+    ; prog_re : 'a (* host reads program memory at prog_addr (only while stopped) *)
     ; prog_addr : 'a [@bits 8]
     ; prog_data : 'a [@bits 16]
     ; run : 'a
@@ -53,6 +54,7 @@ module O = struct
     ; crc : 'a [@bits 32]
     ; bstat : 'a [@bits 4]
     ; be_enabled : 'a
+    ; prog_q : 'a [@bits 16] (* program word at the prog_addr of the cycle before *)
     }
   [@@deriving hardcaml]
 end
@@ -178,7 +180,8 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   (* ---------- fetch / decode ---------- *)
   let run = i.run in
   let next_pc = wire 8 in
-  let sram_addr = mux2 run next_pc (mux2 i.prog_we i.prog_addr (zero 8)) in
+  (* while stopped the SRAM sits on address 0 so that instruction 0 is ready when run goes high *)
+  let sram_addr = mux2 run next_pc (mux2 (i.prog_we |: i.prog_re) i.prog_addr (zero 8)) in
   let instr =
     Sram.create sram_mode ~clock:i.clock ~addr:sram_addr ~din:i.prog_data ~wen:(i.prog_we &: ~:run)
   in
@@ -674,6 +677,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   ; crc = crc.value
   ; bstat
   ; be_enabled = be_en.value
+  ; prog_q = instr
   }
 ;;
 

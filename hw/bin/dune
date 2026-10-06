@@ -1,5 +1,5 @@
-(executable
- (name generate)
+(executables
+ (names generate asm)
  (libraries core hardcaml pemu jane_rope)
  (preprocess
   (pps ppx_jane)))
