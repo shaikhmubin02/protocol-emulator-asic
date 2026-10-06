@@ -12,13 +12,14 @@
      6     flop of element i-2
      7     flop of element i+1
 
-   Config word per element (30 bits): [15:0] lut, [27:16] input selects (4 x 3 bits),
-   [28] output the flop instead of the LUT, [29] init value. *)
+   Config word per element (31 bits): [15:0] lut, [27:16] input selects (4 x 3 bits),
+   [28] output the flop instead of the LUT, [29] init value, [30] clock: 0 = TX ticks,
+   1 = RX ticks. *)
 
 open! Core
 open! Hardcaml
 
-let cfg_bits = 30
+let cfg_bits = 31
 
 module Make (C : Comb.S) = struct
   open C
@@ -26,6 +27,7 @@ module Make (C : Comb.S) = struct
   let bit x i = x.:[i, i]
   let use_ff cfg = bit cfg 28
   let init cfg = bit cfg 29
+  let rx_clocked cfg = bit cfg 30
 
   let lut_out ~cfg ~sources =
     let pick k = mux cfg.:[18 + (3 * k), 16 + (3 * k)] sources in

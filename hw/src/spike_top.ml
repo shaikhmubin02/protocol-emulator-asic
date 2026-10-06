@@ -55,7 +55,7 @@ let create mode (i : _ I.t) : _ O.t =
   (* fabric *)
   let cfgs =
     Array.init n_le ~f:(fun k ->
-      Cfg_store.create mode ~spec ~we:(write_to k) ~d:data.:[29, 0])
+      Cfg_store.create mode ~spec ~we:(write_to k) ~d:data.:[30, 0])
   in
   let q = Array.init n_le ~f:(fun _ -> wire 1) in
   let f, out = L.step ~cfgs ~q ~ext in

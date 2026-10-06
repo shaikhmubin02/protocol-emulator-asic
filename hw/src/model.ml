@@ -37,7 +37,8 @@ end
 
 type bit_engine =
   { mutable enabled : bool
-  ; mutable acc : int
+  ; mutable acc_tx : int
+  ; mutable acc_rx : int
   ; mutable hold : int option
   ; mutable sh_value : int
   ; mutable sh_left : int
@@ -132,7 +133,8 @@ let create ?(mailbox_depth = 2) program =
   ; mailbox_depth
   ; be =
       { enabled = false
-      ; acc = 0
+      ; acc_tx = 0
+      ; acc_rx = 0
       ; hold = None
       ; sh_value = 0
       ; sh_left = 0
@@ -215,7 +217,7 @@ let rxcfg t = t.csr.(Isa.Csr.rxcfg)
 let fabctl t = t.csr.(Isa.Csr.fabctl)
 let fabctl2 t = t.csr.(Isa.Csr.fabctl2)
 let period t = (256 * Int.max 1 t.csr.(Isa.Csr.baud)) + (t.csr.(Isa.Csr.baudf) land 0xff)
-let tick_now t = t.be.enabled && t.be.acc + 256 >= period t
+let tick_now t = t.be.enabled && t.be.acc_tx + 256 >= period t
 
 let bit_reverse32 v =
   List.init 32 ~f:(fun k -> if (v lsr k) land 1 = 1 then 1 lsl (31 - k) else 0)
@@ -521,14 +523,14 @@ let crc_step t bit =
   be.crc <- ((be.crc lsl 1) land mask32) lxor if fb then be.crc_poly else 0
 ;;
 
-let tick t =
+let tick t ~tx_tick ~rx_tick =
   let be = t.be in
   let tx = txcfg t
   and rx = rxcfg t
   and fc = fabctl t
   and fc2 = fabctl2 t in
   (* 1. TX load and next bit *)
-  if be.sh_left = 0
+  if tx_tick && be.sh_left = 0
   then (
     match be.hold with
     | Some v ->
@@ -538,7 +540,7 @@ let tick t =
       be.hold <- None
     | None -> ());
   let tx_bit =
-    if be.sh_left = 0
+    if (not tx_tick) || be.sh_left = 0
     then None
     else (
       let n = field tx ~hi:3 ~lo:0 + 1 in
@@ -547,7 +549,7 @@ let tick t =
   in
   (* 2. RX sample *)
   let rx_sample = Bool.to_int (read_pin t (field rx ~hi:9 ~lo:5)) in
-  (* 3. fabric *)
+  (* 3. fabric: evaluated once; each element only steps on its own tick *)
   let tx_fab = field tx ~hi:10 ~lo:10 = 1
   and rx_fab = field rx ~hi:10 ~lo:10 = 1 in
   let role =
@@ -559,7 +561,9 @@ let tick t =
           (Option.value tx_bit ~default:0 lor (rx_sample lsl 1) lor (field fc ~hi:0 ~lo:0 lsl 2))
       in
       let f, out = Fab.step ~cfgs:be.fab_cfg ~q:be.fab_q ~ext in
-      Array.blit ~src:f ~src_pos:0 ~dst:be.fab_q ~dst_pos:0 ~len:n_le;
+      Array.iteri f ~f:(fun i next ->
+        let on_rx = Bits.to_bool (Fab.rx_clocked be.fab_cfg.(i)) in
+        if (on_rx && rx_tick) || ((not on_rx) && tx_tick) then be.fab_q.(i) <- next);
       fun i -> Bits.to_bool out.(i))
     else fun _ -> false
   in
@@ -567,24 +571,27 @@ let tick t =
   (* 4. TX pin *)
   let tx_pin = field tx ~hi:9 ~lo:5 in
   let consumed =
-    match tx_bit with
-    | Some b ->
-      let line = if tx_fab then role (field fc ~hi:4 ~lo:1) else b = 1 in
-      drive t tx_pin line;
-      let held = tx_fab && field fc ~hi:9 ~lo:9 = 1 && role (field fc ~hi:8 ~lo:5) in
-      if held
-      then None
-      else (
-        be.sh_index <- be.sh_index + 1;
-        be.sh_left <- be.sh_left - 1;
-        Some b)
-    | None ->
-      drive t tx_pin (field tx ~hi:11 ~lo:11 = 1);
-      None
+    if not tx_tick
+    then None
+    else (
+      match tx_bit with
+      | Some b ->
+        let line = if tx_fab then role (field fc ~hi:4 ~lo:1) else b = 1 in
+        drive t tx_pin line;
+        let held = tx_fab && field fc ~hi:9 ~lo:9 = 1 && role (field fc ~hi:8 ~lo:5) in
+        if held
+        then None
+        else (
+          be.sh_index <- be.sh_index + 1;
+          be.sh_left <- be.sh_left - 1;
+          Some b)
+      | None ->
+        drive t tx_pin (field tx ~hi:11 ~lo:11 = 1);
+        None)
   in
   (* 5. RX *)
   let kept =
-    if not be.rx_active
+    if not (rx_tick && be.rx_active)
     then None
     else (
       let b = if rx_fab then Bool.to_int (role (field fc ~hi:13 ~lo:10)) else rx_sample in
@@ -615,16 +622,19 @@ let tick t =
     match field t.csr.(Isa.Csr.crcctl) ~hi:2 ~lo:1 with
     | 0 -> Option.iter consumed ~f:(crc_step t)
     | 1 -> Option.iter kept ~f:(crc_step t)
-    | _ -> crc_step t (Bool.to_int (role (field fc2 ~hi:12 ~lo:9))))
+    | _ -> if tx_tick then crc_step t (Bool.to_int (role (field fc2 ~hi:12 ~lo:9))))
 ;;
 
 let advance_baud t =
   let be = t.be in
   if be.enabled
   then (
-    let fired = be.acc + 256 >= period t in
-    be.acc <- (if fired then be.acc + 256 - period t else be.acc + 256);
-    if fired then tick t)
+    let p = period t in
+    let tx_tick = be.acc_tx + 256 >= p
+    and rx_tick = be.acc_rx + 256 >= p in
+    be.acc_tx <- (if tx_tick then be.acc_tx + 256 - p else be.acc_tx + 256);
+    be.acc_rx <- (if rx_tick then be.acc_rx + 256 - p else be.acc_rx + 256);
+    if tx_tick || rx_tick then tick t ~tx_tick ~rx_tick)
 ;;
 
 (* Instruction effects on the bit engine (spec 7.5: after the tick). *)
@@ -640,7 +650,8 @@ let apply_pending t =
   (match p.p_ben with
    | Some true ->
      be.enabled <- true;
-     be.acc <- 0;
+     be.acc_tx <- 0;
+     be.acc_rx <- 0;
      be.hold <- None;
      be.sh_left <- 0;
      be.sh_index <- 0;
@@ -682,7 +693,7 @@ let update_inputs t pads =
   let rx = rxcfg t in
   let rx_pin = field rx ~hi:9 ~lo:5 in
   let align () =
-    be.acc <- period t - (256 * (Int.max 1 t.csr.(Isa.Csr.baud) / 2))
+    be.acc_rx <- period t - (256 * (Int.max 1 t.csr.(Isa.Csr.baud) / 2))
   in
   if be.enabled
   then (

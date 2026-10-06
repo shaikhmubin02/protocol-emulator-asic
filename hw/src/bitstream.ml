@@ -25,7 +25,7 @@ let source_index = function
 ;;
 
 (* [fn] is the LUT function of its 4 inputs, each 0 or 1. *)
-let word ?(use_ff = false) ?(init = 0) ~inputs fn =
+let word ?(use_ff = false) ?(init = 0) ?(on_rx = false) ~inputs fn =
   let inputs = List.take (inputs @ List.init 4 ~f:(fun _ -> Ext0)) 4 in
   let lut =
     List.init 16 ~f:(fun idx ->
@@ -36,7 +36,11 @@ let word ?(use_ff = false) ?(init = 0) ~inputs fn =
   let sel =
     List.foldi inputs ~init:0 ~f:(fun k acc s -> acc lor (source_index s lsl (3 * k)))
   in
-  lut lor (sel lsl 16) lor ((if use_ff then 1 else 0) lsl 28) lor (init lsl 29)
+  lut
+  lor (sel lsl 16)
+  lor ((if use_ff then 1 else 0) lsl 28)
+  lor (init lsl 29)
+  lor ((if on_rx then 1 else 0) lsl 30)
 ;;
 
 let empty = word ~inputs:[] (fun _ _ _ _ -> 0)

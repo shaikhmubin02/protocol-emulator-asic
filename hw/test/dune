@@ -2,6 +2,7 @@
  (name pemu_test)
  (libraries core hardcaml hardcaml_verify pemu)
  (inline_tests
+  (deps (glob_files ../firmware/*.s))
   (flags (-source-tree-root .)))
  (preprocess
   (pps ppx_hardcaml ppx_jane)))
