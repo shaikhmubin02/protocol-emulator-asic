@@ -7,6 +7,9 @@
 # column's pin shapes that touch the macro edge, joining the stripe stub to the SRAM.
 # Columns are only covered where the macro declares a pin of the right net, never across gaps.
 #
+# It also drops the power pins the generator put on the short stubs, since tile power pins
+# must run the full height.
+#
 # Fails if a macro ends up without both a power and a ground connection.
 
 import sys
@@ -17,6 +20,7 @@ from reader import click_odb
 
 POWER_NETS = {"POWER": "VPWR", "GROUND": "VGND"}
 EDGE_TOLERANCE_UM = 2.0
+PIN_EDGE_MARGIN_UM = 10.0  # TT precheck: power pins must reach within 10 um of top and bottom
 
 
 def macro_power_shapes(inst, layer_name):
@@ -103,6 +107,33 @@ def main(reader, layer_name):
 
     if not macros:
         print("no SRAM macros found")
+
+    # The power generator puts a pin on every stripe piece, including the short stubs it cut at
+    # the SRAM. The tile rules want power pins that run (almost) the full height, so drop the
+    # pins on stubs. The stub metal stays and is still connected through the rails.
+    die = block.getDieArea()
+    margin = int(PIN_EDGE_MARGIN_UM * dbu)
+    for net_name in ("VPWR", "VGND"):
+        bterm = block.findBTerm(net_name)
+        if bterm is None:
+            continue
+        kept = 0
+        for bpin in list(bterm.getBPins()):
+            boxes = list(bpin.getBoxes())
+            full = all(
+                b.yMin() - die.yMin() <= margin and die.yMax() - b.yMax() <= margin for b in boxes
+            )
+            if full:
+                kept += 1
+            else:
+                b = boxes[0]
+                print(f"  removing short {net_name} pin x {um(b.xMin()):.3f} y {um(b.yMin()):.3f}-{um(b.yMax()):.3f}")
+                odb.dbBPin.destroy(bpin)
+        print(f"{net_name}: {kept} full-height pins kept")
+        if kept == 0:
+            print(f"ERROR: no full-height pin left on {net_name}", file=sys.stderr)
+            failed = True
+
     if failed:
         sys.exit(1)
 
