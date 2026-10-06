@@ -19,16 +19,15 @@ let%expect_test "uart.s: full-duplex loopback, back-to-back frames" =
   let prog = load "uart.s" in
   let m = Model.create prog in
   let sent = [ 0x00; 0xFF; 0x55; 0xA5; 0x3C; 0x81; 0x7E ] in
-  List.iter sent ~f:(Model.host_send m);
-  let got = ref [] in
+  let host = Host.create sent in
   let tx = ref 1 in
   for _ = 1 to 2000 do
     (* wire TX (uo[0]) back to RX (ui[3]) *)
     Model.step m { Model.Pads.zero with ui_in = !tx lsl 3 };
     tx := bit (Model.uo_out m) 0;
-    Option.iter (Model.host_receive m) ~f:(fun v -> got := v :: !got)
+    Host.service host m
   done;
-  let got = List.rev !got in
+  let got = Host.received host in
   if not ([%equal: int list] got sent) then raise_s [%message (got : int list) (sent : int list)];
   printf "%d words; echoed %s\n" (Array.length prog) (Sexp.to_string [%sexp (got : int list)]);
   [%expect {| 27 words; echoed (0 255 85 165 60 129 126) |}]
@@ -89,11 +88,13 @@ let%expect_test "spi_master.s against an SPI mode 0 target" =
   let dev = Spi_target.create () in
   let data = [ 0x12; 0x34; 0xF0; 0x0F ] in
   (* one transaction: CS low before the first byte, high after the last *)
-  List.iteri data ~f:(fun i b ->
-    let first = if i = 0 then 0x100 else 0 in
-    let last = if i = List.length data - 1 then 0x200 else 0 in
-    Model.host_send m (b lor first lor last));
-  let replies = ref [] in
+  let host =
+    Host.create
+      (List.mapi data ~f:(fun i b ->
+         let first = if i = 0 then 0x100 else 0 in
+         let last = if i = List.length data - 1 then 0x200 else 0 in
+         b lor first lor last))
+  in
   let cs_rises = ref 0 in
   for _ = 1 to 3000 do
     Model.step m { Model.Pads.zero with ui_in = dev.miso lsl 4 };
@@ -101,9 +102,9 @@ let%expect_test "spi_master.s against an SPI mode 0 target" =
     let cs = bit uo 3 in
     if cs = 1 && dev.cs = 0 then incr cs_rises;
     Spi_target.step dev ~sck:(bit uo 1) ~mosi:(bit uo 2) ~cs;
-    Option.iter (Model.host_receive m) ~f:(fun v -> replies := v :: !replies)
+    Host.service host m
   done;
-  let replies = List.rev !replies in
+  let replies = Host.received host in
   let received = List.rev dev.received in
   let expected_replies = 0xA5 :: List.map (List.drop_last_exn data) ~f:(fun b -> lnot b land 0xff) in
   if not ([%equal: int list] received data) then raise_s [%message (received : int list)];
@@ -252,8 +253,7 @@ let%expect_test "i2c_master.s against an EEPROM that stretches the clock" =
     ; start; write 0x84; stop
     ]
   in
-  List.iter commands ~f:(Model.host_send m);
-  let replies = ref [] in
+  let host = Host.create commands in
   let master_drove_high = ref false in
   for _ = 1 to 20000 do
     let master_low p = bit (Model.uio_oe m) p = 1 && bit (Model.uio_out m) p = 0 in
@@ -264,9 +264,9 @@ let%expect_test "i2c_master.s against an EEPROM that stretches the clock" =
     let sda = if master_low 1 || dev.sda_low then 0 else 1 in
     Eeprom.step dev ~scl ~sda;
     Model.step m { Model.Pads.zero with uio_in = scl lor (sda lsl 1) };
-    Option.iter (Model.host_receive m) ~f:(fun v -> replies := v :: !replies)
+    Host.service host m
   done;
-  let replies = List.rev !replies in
+  let replies = Host.received host in
   let expected = [ 0; 0; 0; 0; 0; 0; 0; 0x5A; 0xC3; 1 ] in
   if not ([%equal: int list] replies expected)
   then raise_s [%message (replies : int list) (expected : int list)];

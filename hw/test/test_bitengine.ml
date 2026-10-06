@@ -129,13 +129,12 @@ idle: csrr r1, bstat
       halt
 |}) in
   Model.set_crc m ~poly:(0x8005 lsl 16) ~init:(0xFFFF lsl 16);
-  String.iter "123456789" ~f:(fun ch -> Model.host_send m (Char.to_int ch));
-  let result = ref None in
+  let host = Host.create (String.to_list "123456789" |> List.map ~f:Char.to_int) in
   for _ = 1 to 1000 do
     Model.step m Model.Pads.zero;
-    Option.iter (Model.host_receive m) ~f:(fun v -> result := Some v)
+    Host.service host m
   done;
-  let crc = Option.value_exn !result lxor 0xFFFF in
+  let crc = List.hd_exn (Host.received host) lxor 0xFFFF in
   if crc <> 0xB4C8 then raise_s [%message "wrong CRC" (crc : int)];
   printf "CRC-16/USB = 0x%04X\n" crc;
   [%expect {| CRC-16/USB = 0xB4C8 |}]

@@ -35,7 +35,7 @@ let create (i : _ I.t) : _ O.t =
   let pc = wire 8 in
   let next_pc = wire 8 in
   let sram_addr = mux2 run next_pc (mux2 load_we sreg.:[23, 16] (zero 8)) in
-  let instr = Sram.create ~clock:i.clk ~addr:sram_addr ~din:sreg.:[15, 0] ~wen:load_we in
+  let instr = Sram.create Asic ~clock:i.clk ~addr:sram_addr ~din:sreg.:[15, 0] ~wen:load_we in
   assign pc (reg spec (mux2 run next_pc (zero 8)));
   (* decode *)
   let op = instr.:[15, 12] in

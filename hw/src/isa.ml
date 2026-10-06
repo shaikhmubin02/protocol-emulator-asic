@@ -382,6 +382,27 @@ module Csr = struct
   let fabctl2 = 0x19
   let group g = 0x20 + g
 
+  (* Read/write CSRs and the bits they keep. Anything else reads 0 and ignores writes, except
+     the read-only status CSRs above. *)
+  let writable =
+    [ tmo, 0xffff
+    ; jpin, 0x1f
+    ; jflag, 0x7
+    ; capcfg, 0x7f
+    ; baud, 0xffff
+    ; baudf, 0xff
+    ; txcfg, 0xfff
+    ; rxcfg, 0x3fff
+    ; crcctl, 0xf
+    ; fabctl, 0x3fff
+    ; fabctl2, 0x1fff
+    ; group 0, 0xff
+    ; group 1, 0xff
+    ; group 2, 0xff
+    ; group 3, 0xff
+    ]
+  ;;
+
   let names =
     [ "time_lo", time_lo
     ; "time_hi", time_hi

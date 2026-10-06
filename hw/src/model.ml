@@ -256,18 +256,9 @@ let read_csr t c =
   then crc_view t land mask16
   else if c = Isa.Csr.crc_hi
   then (crc_view t lsr 16) land mask16
-  else t.csr.(c)
-;;
-
-let read_only =
-  [ Isa.Csr.time_lo
-  ; Isa.Csr.time_hi
-  ; Isa.Csr.cap
-  ; Isa.Csr.flags
-  ; Isa.Csr.bstat
-  ; Isa.Csr.crc_lo
-  ; Isa.Csr.crc_hi
-  ]
+  else if List.Assoc.mem Isa.Csr.writable c ~equal:Int.equal
+  then t.csr.(c)
+  else 0
 ;;
 
 (* ---- ALU ---- *)
@@ -394,7 +385,9 @@ let execute t =
   let p = t.pend in
   let goto pc = finish t ~next_pc:pc ~extra:0 in
   let csr_write c v =
-    if not (List.mem read_only c ~equal:Int.equal) then p.p_csr <- (c, v land mask16) :: p.p_csr
+    match List.Assoc.find Isa.Csr.writable c ~equal:Int.equal with
+    | Some mask -> p.p_csr <- (c, v land mask) :: p.p_csr
+    | None -> ()
   in
   match instr with
   | Nop -> goto next
@@ -733,7 +726,14 @@ let step t (pads : Pads.t) =
 
 (* ---- host side / inspection ---- *)
 
-let host_send t v = Queue.enqueue t.to_engine (v land mask16)
+(* The host can only write when the engine's inbox has room (depth = mailbox_depth). *)
+let host_send t v =
+  if Queue.length t.to_engine < t.mailbox_depth
+  then (
+    Queue.enqueue t.to_engine (v land mask16);
+    true)
+  else false
+;;
 let host_receive t = Queue.dequeue t.from_engine
 let pc t = t.pc
 let reg t i = t.regs.(i)
