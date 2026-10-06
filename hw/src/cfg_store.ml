@@ -13,10 +13,11 @@ type mode =
   | Sim
   | Asic
 
-let create mode ~spec ~we ~d =
+(* [init] is the starting value in simulation (latches on the chip start undefined). *)
+let create ?init mode ~spec ~we ~d =
   let gate = reg spec we in
   match mode with
-  | Sim -> reg spec ~enable:gate d
+  | Sim -> reg spec ?initialize_to:init ~enable:gate d
   | Asic ->
     List.init (width d) ~f:(fun k ->
       let latch =

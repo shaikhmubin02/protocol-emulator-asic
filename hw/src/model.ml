@@ -538,7 +538,8 @@ let tick t ~tx_tick ~rx_tick =
     else (
       let n = field tx ~hi:3 ~lo:0 + 1 in
       let pos = if field tx ~hi:4 ~lo:4 = 1 then n - 1 - be.sh_index else be.sh_index in
-      Some ((be.sh_value lsr pos) land 1))
+      (* modulo 16, so a TXCFG change in the middle of a word is still defined *)
+      Some ((be.sh_value lsr (pos land 15)) land 1))
   in
   (* 2. RX sample *)
   let rx_sample = Bool.to_int (read_pin t (field rx ~hi:9 ~lo:5)) in
@@ -595,9 +596,10 @@ let tick t ~tx_tick ~rx_tick =
         let n = field rx ~hi:3 ~lo:0 + 1 in
         if field rx ~hi:4 ~lo:4 = 1
         then be.rx_shift <- ((be.rx_shift lsl 1) lor b) land mask16
-        else be.rx_shift <- be.rx_shift lor (b lsl be.rx_count);
+        else be.rx_shift <- (be.rx_shift lor (b lsl be.rx_count)) land mask16;
         be.rx_count <- be.rx_count + 1;
-        if be.rx_count = n
+        (* >= so that lowering the RX width in the middle of a frame completes it *)
+        if be.rx_count >= n
         then (
           (* the old word is lost only if it isn't being read in this same cycle *)
           if be.rx_ready && not t.pend.p_rx_take then be.overrun <- true;
@@ -663,12 +665,12 @@ let apply_pending t =
   p.p_csr <- []
 ;;
 
-(* End of cycle: input synchronisers, edge capture, RX start/alignment. *)
-let update_inputs t pads =
-  let before = t.sync2 in
-  t.sync2 <- t.sync1;
-  t.sync1 <- Pads.to_vector pads;
-  let after = t.sync2 in
+(* End of cycle: edge capture and RX start/alignment. Edges compare the two synchroniser stages
+   (the value seen now vs the one seen next cycle) and use the CSRs as they were at the start of
+   the cycle; RX start looks at the RX state after this cycle's tick. *)
+let input_events t ~capcfg ~rx ~baud ~period ~enabled =
+  let before = t.sync2
+  and after = t.sync1 in
   let edge_on p ~mode =
     let was = read_vector before p
     and now = read_vector after p in
@@ -677,18 +679,14 @@ let update_inputs t pads =
     | 1 -> was && not now
     | _ -> not (Bool.equal was now)
   in
-  let cfg = t.csr.(Isa.Csr.capcfg) in
-  if edge_on (cfg land 31) ~mode:((cfg lsr 5) land 3)
+  if edge_on (capcfg land 31) ~mode:((capcfg lsr 5) land 3)
   then (
-    t.cap <- t.time;
+    t.cap <- (t.time + 1) land mask32;
     t.captured <- true);
   let be = t.be in
-  let rx = rxcfg t in
   let rx_pin = field rx ~hi:9 ~lo:5 in
-  let align () =
-    be.acc_rx <- period t - (256 * (Int.max 1 t.csr.(Isa.Csr.baud) / 2))
-  in
-  if be.enabled
+  let align () = be.acc_rx <- period - (256 * (Int.max 1 baud / 2)) in
+  if enabled
   then (
     let start = field rx ~hi:13 ~lo:12 in
     if (not be.rx_active) && start <> 0
@@ -711,6 +709,11 @@ let update_inputs t pads =
 
 let step t (pads : Pads.t) =
   t.be.completed <- false;
+  let capcfg = t.csr.(Isa.Csr.capcfg)
+  and rx = rxcfg t
+  and baud = t.csr.(Isa.Csr.baud)
+  and period_now = period t
+  and enabled = t.be.enabled in
   if not t.halted
   then
     if t.busy > 0
@@ -719,9 +722,11 @@ let step t (pads : Pads.t) =
       if t.busy = 0 then t.pc <- t.busy_next_pc)
     else execute t;
   advance_baud t;
+  input_events t ~capcfg ~rx ~baud ~period:period_now ~enabled;
   apply_pending t;
   t.time <- (t.time + 1) land mask32;
-  update_inputs t pads
+  t.sync2 <- t.sync1;
+  t.sync1 <- Pads.to_vector pads
 ;;
 
 (* ---- host side / inspection ---- *)

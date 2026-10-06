@@ -4,27 +4,39 @@ open Pemu
 let bit v k = (v lsr k) land 1
 
 (* A random program of valid instructions, biased towards the things uniform random words almost
-   never produce: CSR writes (TMO, pin groups, JPIN, JFLAG, capture config) and waits.
-   Bit-engine instructions are left out until the RTL has the bit engine. *)
+   never produce: CSR writes (TMO, pin groups, bit engine config, ...), waits, and the bit-engine
+   instructions. *)
 let random_program rng =
-  let bit_engine (i : Isa.t) =
-    match i with
-    | Tx _ | Rx _ | Crci | Ben _ -> true
-    | _ -> false
-  in
   let rec any () =
     let w = Random.State.int rng 0x10000 in
     match Isa.decode w with
-    | Some i when not (bit_engine i) -> w
-    | _ -> any ()
+    | Some _ -> w
+    | None -> any ()
   in
   let writable = Array.of_list (List.map Isa.Csr.writable ~f:fst) in
-  Array.init 256 ~f:(fun _ ->
+  let bit_engine_csrs =
+    Isa.Csr.[| txcfg; rxcfg; fabctl; fabctl2; crcctl; capcfg; baud; baudf; group 0 |]
+  in
+  (* CSRWI only carries 6 bits, so full-width CSR values need ldi + ldih + csrw *)
+  let full_csr_write () =
+    let csr = bit_engine_csrs.(Random.State.int rng (Array.length bit_engine_csrs)) in
+    let v = Random.State.int rng 0x10000 in
+    let v = if csr = Isa.Csr.baud then v land 7 else v in
+    let r = Random.State.int rng 8 in
+    Isa.[ Ldi (r, v land 0xff); Ldih (r, v lsr 8); Csrw (csr, r) ]
+  in
+  let one () =
     match Random.State.int rng 100 with
     | n when n < 15 ->
       let csr = writable.(Random.State.int rng (Array.length writable)) in
       (* small TMO values so timeouts actually happen *)
-      let v = if csr = Isa.Csr.tmo then Random.State.int rng 12 else Random.State.int rng 64 in
+      let v =
+        if csr = Isa.Csr.tmo
+        then Random.State.int rng 12
+        else if csr = Isa.Csr.baud
+        then Random.State.int rng 6 (* fast ticks so the bit engine does a lot *)
+        else Random.State.int rng 64
+      in
       Isa.encode_exn (Csrwi (csr, v))
     | n when n < 25 ->
       let w : Isa.wait =
@@ -35,18 +47,91 @@ let random_program rng =
         | _ -> Wait_event (List.random_element_exn ~random_state:rng [ Isa.Ev_capture; Ev_mailbox; Ev_tx_empty ])
       in
       Isa.encode_exn (Wait w)
-    | _ -> any ())
+    | n when n < 35 ->
+      let r = Random.State.int rng 8 in
+      Isa.encode_exn
+        (List.random_element_exn
+           ~random_state:rng
+           [ Isa.Tx r; Rx r; Crci; Ben true; Ben true; Ben false; Ldi (r, Random.State.int rng 256) ])
+    | _ -> any ()
+  in
+  let rec fill acc n =
+    if n >= 256
+    then List.rev acc
+    else if Random.State.int rng 100 < 8
+    then (
+      let seq = List.map (full_csr_write ()) ~f:Isa.encode_exn in
+      fill (List.rev_append seq acc) (n + List.length seq))
+    else fill (one () :: acc) (n + 1)
+  in
+  let prologue =
+    (* half the programs start by putting the bit engine in a busy, meaningful setup: CRC on with a
+       random source, RX in a start-edge mode, random routing through the fabric *)
+    if Random.State.bool rng
+    then (
+      let set csr v r = Isa.[ Ldi (r, v land 0xff); Ldih (r, v lsr 8); Csrw (csr, r) ] in
+      let pin () = Random.State.int rng 24 in
+      let txcfg =
+        Random.State.int rng 16 lor (Random.State.int rng 2 lsl 4) lor (pin () lsl 5)
+        lor (Random.State.int rng 2 lsl 10) lor (Random.State.int rng 2 lsl 11)
+      and rxcfg =
+        Random.State.int rng 16 lor (Random.State.int rng 2 lsl 4) lor (pin () lsl 5)
+        lor (Random.State.int rng 2 lsl 10) lor (Random.State.int rng 2 lsl 11)
+        lor ((1 + Random.State.int rng 3) lsl 12)
+      and crcctl = 1 lor (Random.State.int rng 3 lsl 1) lor (Random.State.int rng 2 lsl 3) in
+      List.concat
+        [ set Isa.Csr.txcfg txcfg 0
+        ; set Isa.Csr.rxcfg rxcfg 1
+        ; set Isa.Csr.crcctl crcctl 2
+        ; set Isa.Csr.fabctl (Random.State.int rng 0x4000) 3
+        ; set Isa.Csr.fabctl2 (Random.State.int rng 0x2000) 4
+        ; Isa.[ Csrwi (Csr.baud, 1 + Random.State.int rng 4); Crci; Ben true ]
+        ]
+      |> List.map ~f:Isa.encode_exn)
+    else []
+  in
+  let body = fill [] (List.length prologue) in
+  Array.of_list (List.take (prologue @ body) 256)
 ;;
+
+(* how much of the bit engine the random programs reach *)
+let coverage = Array.create ~len:8 0
 
 let run_random ~seed ~cycles =
   let rng = Random.State.make [| seed |] in
   let program = random_program rng in
-  let ls = Lockstep.create program in
+  let fabric = Array.init Model.n_le ~f:(fun _ -> Random.State.int rng (1 lsl Fabric_logic.cfg_bits)) in
+  let crc_poly = Random.State.int rng 0x1_0000_0000
+  and crc_init = Random.State.int rng 0x1_0000_0000 in
+  let ls = Lockstep.create ~fabric ~crc_poly ~crc_init program in
   for _ = 1 to cycles do
     let pads = { Model.Pads.uio_in = Random.State.int rng 256; ui_in = Random.State.int rng 256 } in
     let send = if Random.State.int rng 4 = 0 then Some (Random.State.int rng 0x10000) else None in
     let receive = Random.State.int rng 3 = 0 in
-    ignore (Lockstep.step ?send ~receive ls pads : int option * bool)
+    let m = ls.model in
+    let crc_before = m.be.crc
+    and q_before = Array.map m.be.fab_q ~f:Hardcaml.Bits.to_int_trunc
+    and left_before = m.be.sh_left
+    and ready_before = m.be.rx_ready
+    and acc_before = m.be.acc_rx
+    and active_before = m.be.rx_active in
+    ignore (Lockstep.step ?send ~receive ls pads : int option * bool);
+    let bump k b = if b then coverage.(k) <- coverage.(k) + 1 in
+    bump 0 m.be.enabled;
+    bump 1 (m.be.sh_left < left_before);
+    bump 2 (m.be.rx_ready && not ready_before);
+    bump 3 (m.be.crc <> crc_before);
+    bump 4 (not ([%equal: int array] q_before (Array.map m.be.fab_q ~f:Hardcaml.Bits.to_int_trunc)));
+    bump 5 (m.be.rx_active && ((not active_before) || m.be.acc_rx < acc_before - 256));
+    (* a CRC step with data bit 1 (the result differs from stepping with a 0) *)
+    let step_with_zero =
+      let fb = (crc_before lsr 31) land 1 = 1 in
+      ((crc_before lsl 1) land 0xffff_ffff) lxor if fb then m.be.crc_poly else 0
+    in
+    bump 6 (m.be.crc <> crc_before && m.be.crc <> step_with_zero && m.be.crc <> m.be.crc_init);
+    bump 7 (Array.existsi m.be.fab_cfg ~f:(fun k cfg ->
+      Hardcaml.Bits.to_bool (Model.Fab.rx_clocked cfg)
+      && Hardcaml.Bits.to_int_trunc m.be.fab_q.(k) <> q_before.(k)))
   done
 ;;
 
@@ -58,7 +143,20 @@ let%expect_test "random programs: RTL = model every cycle" =
     | Lockstep.Mismatch s -> raise_s [%message "seed" (seed : int) (s : Sexp.t)]
   done;
   printf "%d random programs x %d cycles: no difference\n" programs cycles;
-  [%expect {| 300 random programs x 2000 cycles: no difference |}]
+  printf
+    "bit engine: on %d, TX bits %d, RX words %d, CRC steps %d (data=1: %d), fabric changes %d (RX-clocked: %d), RX starts/aligns %d\n"
+    coverage.(0)
+    coverage.(1)
+    coverage.(2)
+    coverage.(3)
+    coverage.(6)
+    coverage.(4)
+    coverage.(7)
+    coverage.(5);
+  [%expect {|
+    300 random programs x 2000 cycles: no difference
+    bit engine: on 355837, TX bits 3175, RX words 2634, CRC steps 67555 (data=1: 22492), fabric changes 101944 (RX-clocked: 84941), RX starts/aligns 31030
+    |}]
 ;;
 
 let load name =
@@ -117,4 +215,54 @@ let%expect_test "i2c_master.s in lockstep with a stretching target" =
   done;
   printf "%d cycles in lockstep, %d replies\n" ls.cycle (List.length !got);
   [%expect {| 20000 cycles in lockstep, 6 replies |}]
+;;
+
+let%expect_test "uart.s in lockstep, TX wired back to RX" =
+  let ls = Lockstep.create (load "uart.s") in
+  let pending = Queue.of_list [ 0x00; 0xFF; 0x55; 0xA5; 0x3C ] in
+  let got = ref [] in
+  let tx = ref 1 in
+  for _ = 1 to 1500 do
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = !tx lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got);
+    tx := bit (Lockstep.uo ls) 0
+  done;
+  let got = List.rev !got in
+  if not ([%equal: int list] got [ 0x00; 0xFF; 0x55; 0xA5; 0x3C ]) then raise_s [%message (got : int list)];
+  printf "%d cycles in lockstep, echoed %s\n" ls.cycle (Sexp.to_string [%sexp (got : int list)]);
+  [%expect {| 1500 cycles in lockstep, echoed (0 255 85 165 60) |}]
+;;
+
+let%expect_test "USB NRZI + bit stuffing bitstream in lockstep" =
+  let program =
+    match
+      Asm.assemble
+        {|
+      ldi  r1, 0x07
+      ldih r1, 0x0d        ; txcfg: 8 bits, LSB first, pin 8, through fabric, idle high
+      csrw txcfg, r1
+      ldi  r1, 0x0e
+      ldih r1, 0x02        ; fabctl: line = element 7, hold = element 0, hold enabled
+      csrw fabctl, r1
+      csrwi baud, 3
+      ben  1
+loop: pull r0
+      tx   r0
+      jmp  loop
+|}
+    with
+    | Ok w -> w
+    | Error e -> failwith e
+  in
+  let ls = Lockstep.create ~fabric:(Bitstream.usb_tx ~n_le:Model.n_le) program in
+  let pending = Queue.of_list [ 0xFF; 0xFF; 0x81; 0x7E; 0xFE; 0x3F ] in
+  for _ = 1 to 600 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int)
+  done;
+  printf "%d cycles in lockstep, %d bytes left unsent\n" ls.cycle (Queue.length pending);
+  [%expect {| 600 cycles in lockstep, 0 bytes left unsent |}]
 ;;

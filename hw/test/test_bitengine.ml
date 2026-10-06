@@ -140,25 +140,7 @@ idle: csrr r1, bstat
   [%expect {| CRC-16/USB = 0xB4C8 |}]
 ;;
 
-(* USB-style line coding in the fabric: bit stuffing (a 0 after six 1s) then NRZI (0 = toggle).
-   Element 0 = hold (= six 1s sent), 1..6 = "last k bits were 1" thermometer, 7 = NRZI line. *)
-let usb_tx_bitstream =
-  let open Bitstream in
-  let w = Array.create ~len:Model.n_le empty in
-  (* hold: the flop of element 1 (all six of the last bits were 1) *)
-  w.(0) <- word ~inputs:[ Next ] (fun t5 _ _ _ -> t5);
-  for k = 1 to 6 do
-    let inputs = if k = 6 then [ Ext0; Le0 ] else [ Ext0; Le0; Next ] in
-    w.(k)
-    <- word ~use_ff:true ~inputs (fun d hold above _ ->
-         let sent = d land (1 - hold) in
-         if k = 6 then sent else sent land above)
-  done;
-  w.(7) <- word ~init:1 ~inputs:[ Ext0; Le0; Self ] (fun d hold prev _ ->
-    let sent = d land (1 - hold) in
-    if sent = 1 then prev else 1 - prev);
-  w
-;;
+let usb_tx_bitstream = Bitstream.usb_tx ~n_le:Model.n_le
 
 let reference_usb_tx bits =
   let stuffed =

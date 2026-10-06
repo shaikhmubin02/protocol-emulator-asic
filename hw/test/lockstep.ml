@@ -16,15 +16,19 @@ type t =
   ; mutable cycle : int
   }
 
-let create program =
-  let sim = Sim.create (Engine.create (Sram.Sim program)) in
+let create ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) program =
+  let sim = Sim.create (Engine.create (Engine.Mode.sim ~fabric ~crc_poly ~crc_init program)) in
   let i = Cyclesim.inputs sim
   and o = Cyclesim.outputs sim in
   let set r w v = r := Bits.of_int_trunc ~width:w v in
   set i.rst_n 1 1;
   set i.run 1 1;
   set i.owned 15 0x7fff;
-  { sim; i; o; model = Model.create program; program; cycle = 0 }
+  set i.cfg_we 1 0;
+  let model = Model.create program in
+  Model.set_fabric model fabric;
+  Model.set_crc model ~poly:crc_poly ~init:crc_init;
+  { sim; i; o; model; program; cycle = 0 }
 ;;
 
 let get r = Bits.to_int_trunc !r
@@ -62,6 +66,9 @@ let compare_state t =
   check "time" ~rtl:(get o.time) ~model:m.time;
   check "inbox" ~rtl:(get o.inbox_count) ~model:(Queue.length m.to_engine);
   check "outbox" ~rtl:(get o.outbox_count) ~model:(Queue.length m.from_engine);
+  check "crc" ~rtl:(get o.crc) ~model:m.be.crc;
+  check "bit engine on" ~rtl:(get o.be_enabled) ~model:(Bool.to_int m.be.enabled);
+  check "bstat" ~rtl:(get o.bstat) ~model:(Model.read_csr m Isa.Csr.bstat);
   for q = 0 to 14 do
     check (sprintf "out[%d]" q) ~rtl:((get o.out lsr q) land 1) ~model:(Bool.to_int m.out.(q));
     check (sprintf "oe[%d]" q) ~rtl:((get o.oe lsr q) land 1) ~model:(Bool.to_int m.oe.(q))
