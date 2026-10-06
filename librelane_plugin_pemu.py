@@ -25,9 +25,13 @@ class BridgeSramPower(OdbpyStep):
         return os.path.join(HERE, "scripts", "bridge_sram_power.py")
 
 
-# Netgen writes SRAM pin names like VDD! as "\VDD!" in its JSON report, which json.loads
-# rejects. Double any backslash that doesn't start a valid JSON escape before parsing.
-_stray_backslash = re.compile(r'\\(?![\\"/bfnrtu])')
+# Netgen writes names like VDD! or uio_in as "\VDD!" / "\uio_in" in its JSON report, which
+# json.loads rejects. Keep real JSON escapes as they are and double any other backslash.
+_backslash = re.compile(r'\\(u[0-9a-fA-F]{4}|["\\/bfnrt])?')
+
+
+def _fix_escapes(text):
+    return _backslash.sub(lambda m: m.group(0) if m.group(1) else "\\\\", text)
 
 
 class _NetgenJson:
@@ -36,7 +40,7 @@ class _NetgenJson:
 
     @staticmethod
     def loads(text, *args, **kwargs):
-        return json.loads(_stray_backslash.sub(r"\\\\", text), *args, **kwargs)
+        return json.loads(_fix_escapes(text), *args, **kwargs)
 
 
 netgen.json = _NetgenJson()
