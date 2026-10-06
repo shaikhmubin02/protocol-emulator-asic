@@ -1,4 +1,5 @@
 {
+  "//": "One SRAM per engine, in a row along the bottom, 300 um apart: 6 stripe pitches, so each one lines up with the stripes the same way, and room between them for the pins (all on the bottom edge) to get out.",
   "//": "SRAM: the power stripes are placed so some land on the SRAM power columns; Pemu.BridgeSramPower joins them (see scripts/bridge_sram_power.py).",
   "meta": {
     "flow": "Classic",
@@ -9,7 +10,10 @@
   "MACROS": {
     "RM_IHPSG13_1P_256x16_c2_bm_bist": {
       "instances": {
-        "sram": { "location": [57.215, 37.8], "orientation": "R0" }
+        "engine0.sram": { "location": [57.215, 37.8], "orientation": "R0" },
+        "engine1.sram": { "location": [357.215, 37.8], "orientation": "R0" },
+        "engine2.sram": { "location": [657.215, 37.8], "orientation": "R0" },
+        "engine3.sram": { "location": [957.215, 37.8], "orientation": "R0" }
       },
       "gds": ["dir::../macro/RM_IHPSG13_1P_256x16_c2_bm_bist/RM_IHPSG13_1P_256x16_c2_bm_bist.gds"],
       "lef": ["dir::../macro/RM_IHPSG13_1P_256x16_c2_bm_bist/RM_IHPSG13_1P_256x16_c2_bm_bist.lef"],
@@ -23,8 +27,8 @@
     }
   },
   "PDN_MACRO_CONNECTIONS": [
-    "sram VPWR VGND VDD! VSS!",
-    "sram VPWR VGND VDDARRAY! VSS!"
+    "engine[0-3].sram VPWR VGND VDD! VSS!",
+    "engine[0-3].sram VPWR VGND VDDARRAY! VSS!"
   ],
   "PDN_CFG": "dir::pdn_cfg.tcl",
   "PDN_VERTICAL_LAYER": "Metal4",

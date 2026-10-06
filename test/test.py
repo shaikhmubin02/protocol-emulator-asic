@@ -1,111 +1,162 @@
 # SPDX-FileCopyrightText: © 2026 Mubin
 # SPDX-License-Identifier: Apache-2.0
 
+# Drives the chip only through its pins, like a board would: everything goes over the host
+# SPI port (ui[0] SCK, ui[1] CSn, ui[2] MOSI, uo[7] MISO). Address map: hw/src/chip.ml.
+
+import os
+import random
+
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, ReadOnly, RisingEdge
+from cocotb.triggers import ClockCycles, FallingEdge
 
-NOP, LDI, ADD, OUT, JMP, DJNZ, WAITP, IN, JNZ = range(9)
+HERE = os.path.dirname(os.path.abspath(__file__))
+HALF = 4  # SCK = clk/8
+
+CHIP_ID = 0x5045
 
 
-def ins(op, rd=0, rs=0, imm=0):
-    return (op << 12) | (rd << 8) | (rs << 4) | imm if op in (ADD, OUT) else (op << 12) | (rd << 8) | imm
+def engine_addr(e, region, off):
+    return (e << 14) | (region << 12) | off
+
+
+def program(e, off=0):
+    return engine_addr(e, 0, off)
+
+
+def status(e):
+    return engine_addr(e, 2, 0)
+
+
+def mailbox(e):
+    return engine_addr(e, 2, 0x80)
+
+
+def glob(off):
+    return engine_addr(0, 3, off)
+
+
+def firmware(name):
+    with open(os.path.join(HERE, "firmware", name)) as f:
+        return [int(line, 16) for line in f if line.strip()]
+
+
+class Board:
+    """Everything outside the chip: the SPI host and whatever is wired to the protocol pins.
+    Inputs change on the falling clock edge and outputs are read there too, half a cycle
+    away from the chip's rising edge."""
+
+    def __init__(self, dut):
+        self.dut = dut
+        self.sck = 0
+        self.cs_n = 1
+        self.mosi = 0
+        self.ui = 0  # ui[7:3]
+        self.loop_tx_to_rx = False  # uo[0] -> ui[3]
+
+    async def drive(self):
+        while True:
+            await FallingEdge(self.dut.clk)
+            ui = self.ui
+            if self.loop_tx_to_rx:
+                ui = (ui & ~0x08) | ((self.uo() & 1) << 3)
+            self.dut.ui_in.value = (ui & 0xF8) | (self.mosi << 2) | (self.cs_n << 1) | self.sck
+
+    def uo(self):
+        return int(self.dut.uo_out.value)
+
+    async def wait(self, n):
+        for _ in range(n):
+            await FallingEdge(self.dut.clk)
+
+    async def transfer(self, data):
+        self.cs_n = 0
+        await self.wait(HALF)
+        got = []
+        for b in data:
+            r = 0
+            for k in range(7, -1, -1):
+                self.mosi = (b >> k) & 1
+                await self.wait(HALF)
+                r = (r << 1) | (self.uo() >> 7)
+                self.sck = 1
+                await self.wait(HALF)
+                self.sck = 0
+            got.append(r)
+        await self.wait(HALF)
+        self.cs_n = 1
+        await self.wait(2 * HALF)
+        return got
+
+    async def write(self, addr, words):
+        data = [0x02, addr >> 8, addr & 0xFF]
+        for w in words:
+            data += [w >> 8, w & 0xFF]
+        await self.transfer(data)
+
+    async def read(self, addr, n=1):
+        got = await self.transfer([0x03, addr >> 8, addr & 0xFF, 0] + [0] * (2 * n))
+        got = got[4:]
+        return [(got[2 * k] << 8) | got[2 * k + 1] for k in range(n)]
+
+    async def read1(self, addr):
+        return (await self.read(addr))[0]
 
 
 async def start(dut):
     cocotb.start_soon(Clock(dut.clk, 20, unit="ns").start())
     dut.ena.value = 1
-    dut.ui_in.value = 0
+    dut.ui_in.value = 0b010  # CSn high
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 5)
     dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 2)
-
-
-async def load(dut, program, extra_ui=0):
-    for addr, word in enumerate(program):
-        w = (addr << 16) | word
-        for k in range(23, -1, -1):
-            dut.ui_in.value = extra_ui | 0b10 | ((w >> k) & 1)
-            await ClockCycles(dut.clk, 1)
-        dut.ui_in.value = extra_ui | 0b100
-        await ClockCycles(dut.clk, 1)
-        dut.ui_in.value = extra_ui
-        await ClockCycles(dut.clk, 2)
-
-
-async def run_and_trace(dut, cycles, extra_ui=0):
-    """Start the core and record (pc, uo) after every clock edge."""
-    dut.ui_in.value = extra_ui | 0b1000
-    trace = []
-    for _ in range(cycles):
-        await RisingEdge(dut.clk)
-        await ReadOnly()
-        trace.append((int(dut.uio_out.value), int(dut.uo_out.value)))
-    return trace
+    board = Board(dut)
+    cocotb.start_soon(board.drive())
+    await board.wait(4)
+    return board
 
 
 @cocotb.test()
-async def test_loop_timing(dut):
-    # r1 = 5, r3 = 1; loop: r2 += r3; out r2; djnz r1, loop; then spin
-    prog = [
-        ins(LDI, rd=1, imm=5),
-        ins(LDI, rd=3, imm=1),
-        ins(ADD, rd=2, rs=3),  # 2: loop
-        ins(OUT, rs=2),
-        ins(DJNZ, rd=1, imm=2),
-        ins(JMP, imm=5),  # 5: spin
-    ]
-    await start(dut)
-    await load(dut, prog)
-    trace = await run_and_trace(dut, 30)
-    changes = [i for i in range(1, len(trace)) if trace[i][1] != trace[i - 1][1]]
-    values = [trace[i][1] for i in changes]
-    dut._log.info(f"uo changed at cycles {changes} to {values}")
-    assert values == [1, 2, 3, 4, 5], values
-    gaps = [b - a for a, b in zip(changes, changes[1:])]
-    # 3 instructions per iteration, the taken DJNZ included: exactly 3 cycles apart
-    assert gaps == [3, 3, 3, 3], gaps
-    assert trace[-1][0] == 5, f"should end spinning at pc 5, got {trace[-1][0]}"
+async def test_reset_state(dut):
+    b = await start(dut)
+    assert await b.read1(glob(0x20)) == CHIP_ID
+    assert await b.read1(glob(0x10)) == 0, "no engine should run after reset"
+    assert int(dut.uio_oe.value) == 0, "no pin should be driven after reset"
+    assert b.uo() & 0x7F == 0
 
 
 @cocotb.test()
-async def test_waitp_exact(dut):
-    # wait for ui[7] = 1, then out r1 (= 0x55)
-    prog = [ins(LDI, rd=1, imm=0x55), ins(WAITP, rd=7, imm=1), ins(OUT, rs=1), ins(JMP, imm=3)]
-    await start(dut)
-    await load(dut, prog)
-    dut.ui_in.value = 0b1000
-    for _ in range(10):
-        await RisingEdge(dut.clk)
-    await ReadOnly()
-    assert int(dut.uio_out.value) == 1, "should be waiting at pc 1"
-    assert int(dut.uo_out.value) == 0
-    await RisingEdge(dut.clk)
-    dut.ui_in.value = 0b1000_1000  # pin goes high between edges
-    await RisingEdge(dut.clk)  # WAITP sees it: pc -> 2
-    await ReadOnly()
-    assert int(dut.uio_out.value) == 2
-    await RisingEdge(dut.clk)  # OUT executes
-    await ReadOnly()
-    assert int(dut.uo_out.value) == 0x55
+async def test_program_readback(dut):
+    b = await start(dut)
+    rng = random.Random(7)
+    words = {e: [rng.randrange(0x10000) for _ in range(8)] for e in (0, 3)}
+    for e, w in words.items():
+        await b.write(program(e, 200), w)
+    for e, w in words.items():
+        back = await b.read(program(e, 200), len(w))
+        assert back == w, f"engine {e}: wrote {w}, read {back}"
 
 
 @cocotb.test()
-async def test_jnz_and_in(dut):
-    # r1 = ui; if r1 != 0 jump to 4 (out 7) else out 1
-    prog = [
-        ins(IN, rd=1),
-        ins(JNZ, rd=1, imm=4),
-        ins(LDI, rd=2, imm=1),
-        ins(JMP, imm=5),
-        ins(LDI, rd=2, imm=7),
-        ins(OUT, rs=2),
-        ins(JMP, imm=6),
-    ]
-    await start(dut)
-    await load(dut, prog)
-    trace = await run_and_trace(dut, 12)
-    # ui = 0b1000 (run) so r1 = 8, nonzero -> out 7
-    assert trace[-1][1] == 7, trace
+async def test_uart_loopback(dut):
+    """uart.s on engine 1, TX on uo[0] wired back to RX on ui[3]."""
+    b = await start(dut)
+    await b.write(program(1), firmware("uart.hex"))
+    await b.write(glob(8), [0b100 | 1])  # pin 8 (uo[0]) belongs to engine 1
+    await b.write(glob(0x10), [0b0010])  # run engine 1
+    b.loop_tx_to_rx = True
+    sent = [0x00, 0xFF, 0x5A, 0xC3]
+    pending = list(sent)
+    got = []
+    for _ in range(100):
+        if len(got) == len(sent):
+            break
+        st = await b.read1(status(1))
+        inbox, outbox = (st >> 10) & 3, (st >> 12) & 3
+        if outbox:
+            got += await b.read(mailbox(1), outbox)
+        if inbox < 2 and pending:
+            await b.write(mailbox(1), [pending.pop(0)])
+    assert got == sent, f"sent {sent}, got {got}"
