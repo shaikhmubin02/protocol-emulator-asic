@@ -379,6 +379,7 @@ module Csr = struct
   let crc_hi = 0x11
   let crcctl = 0x12
   let fabctl = 0x18
+  let fabctl2 = 0x19
   let group g = 0x20 + g
 
   let names =
@@ -399,6 +400,7 @@ module Csr = struct
     ; "crc_hi", crc_hi
     ; "crcctl", crcctl
     ; "fabctl", fabctl
+    ; "fabctl2", fabctl2
     ; "group0", group 0
     ; "group1", group 1
     ; "group2", group 2
