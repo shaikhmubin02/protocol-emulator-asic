@@ -14,6 +14,7 @@ ifneq ($(GATES),yes)
 SIM_BUILD				= sim_build/rtl
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
 VERILOG_SOURCES += $(PWD)/sim_models.v
+COMPILE_ARGS    += -DFUNCTIONAL
 
 else
 
@@ -30,6 +31,8 @@ VERILOG_SOURCES += $(PDK_ROOT)/ihp-sg13cmos5l/libs.ref/sg13cmos5l_stdcell/verilo
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
 
 endif
+
+VERILOG_SOURCES += $(PWD)/models/RM_IHPSG13_1P_core_behavioral_bm_bist.v $(PWD)/models/RM_IHPSG13_1P_256x16_c2_bm_bist.v
 
 # Allow sharing configuration between design and testbench via `include`:
 COMPILE_ARGS 		+= -I$(SRC_DIR)
