@@ -394,8 +394,8 @@ module Csr = struct
     ; txcfg, 0xfff
     ; rxcfg, 0x3fff
     ; crcctl, 0xf
-    ; fabctl, 0x3fff
-    ; fabctl2, 0x1fff
+    ; fabctl, 0x1eef (* element fields [3:1] [7:5] [12:10]; bits 4, 8, 13 reserved *)
+    ; fabctl2, 0x0ef7 (* element fields [2:0] [7:5] [11:9]; bits 3, 8, 12 reserved *)
     ; group 0, 0xff
     ; group 1, 0xff
     ; group 2, 0xff

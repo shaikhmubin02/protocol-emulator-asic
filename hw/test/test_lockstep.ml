@@ -64,7 +64,7 @@ let%expect_test "random programs: RTL = model every cycle" =
     coverage.(5);
   [%expect {|
     300 random programs x 2000 cycles: no difference
-    bit engine: on 355837, TX bits 3175, RX words 2634, CRC steps 67555 (data=1: 22492), fabric changes 101944 (RX-clocked: 84941), RX starts/aligns 31030
+    bit engine: on 351195, TX bits 3192, RX words 2516, CRC steps 65979 (data=1: 22858), fabric changes 78265 (RX-clocked: 60030), RX starts/aligns 30085
     |}]
 ;;
 

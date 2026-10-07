@@ -5,7 +5,7 @@
    the SRAM address, so every instruction (jumps included) takes one cycle.
 
    Configuration the host writes (fabric words, CRC polynomial and init) goes through cfg_we /
-   cfg_addr (0..15 fabric element, 16 polynomial, 17 init) / cfg_data. In simulation it can also
+   cfg_addr (0..7 fabric element, 16 polynomial, 17 init) / cfg_data. In simulation it can also
    start preloaded. *)
 
 open! Core
@@ -62,6 +62,21 @@ end
 let bit x k = x.:[k, k]
 let width_of_mask m = Int.popcount m
 
+(* A CSR keeps only the bits its mask allows: [gather] picks them out of a 16-bit value, [scatter]
+   puts them back at their positions (up to the highest one). *)
+let mask_bits mask = List.filter (List.init 16 ~f:Fn.id) ~f:(fun k -> (mask lsr k) land 1 = 1)
+let gather mask v = concat_lsb (List.map (mask_bits mask) ~f:(fun k -> v.:[k, k]))
+
+let scatter mask stored =
+  let bits = mask_bits mask in
+  let top = List.last_exn bits in
+  concat_lsb
+    (List.init (top + 1) ~f:(fun k ->
+       match List.findi bits ~f:(fun _ b -> b = k) with
+       | Some (i, _) -> stored.:[i, i]
+       | None -> gnd))
+;;
+
 (* rotate a 17-bit value left by m (0..16) *)
 let rotl17 v m =
   List.foldi (bits_lsb m) ~init:v ~f:(fun k acc b -> mux2 b (rotl acc ~by:(1 lsl k)) acc)
@@ -94,7 +109,7 @@ end
 
 module Fab = Fabric_logic.Make (Signal)
 
-let n_le = 16
+let n_le = 8
 
 let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let cfg_spec = Reg_spec.create ~clock:i.clock ~reset:i.rst_n ~reset_level:Low () in
@@ -140,8 +155,8 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let time = i.time in
   let csrs = List.map Isa.Csr.writable ~f:(fun (addr, mask) -> addr, mask, var (width_of_mask mask)) in
   let csr_value addr =
-    let _, _, v = List.find_exn csrs ~f:(fun (a, _, _) -> a = addr) in
-    v.value
+    let _, mask, v = List.find_exn csrs ~f:(fun (a, _, _) -> a = addr) in
+    scatter mask v.value
   in
   (* mailboxes: 2-deep FIFOs, head in e0 *)
   let fifo () = var 2, var 16, var 16 in
@@ -347,7 +362,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
       ; Isa.Csr.crc_lo, crc_view.:[15, 0]
       ; Isa.Csr.crc_hi, crc_view.:[31, 16]
       ]
-      @ List.map csrs ~f:(fun (a, _, v) -> a, uresize v.value ~width:16)
+      @ List.map csrs ~f:(fun (a, mask, v) -> a, uresize (scatter mask v.value) ~width:16)
     in
     List.fold named ~init:(zero 16) ~f:(fun acc (a, v) -> mux2 (caddr ==:. a) v acc)
   in
@@ -512,14 +527,14 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   in
   let role idx = fabric_used &: mux idx (Array.to_list fab_out) in
   (* 4. TX pin *)
-  let line = mux2 tx_fab (role fabctl.:[4, 1]) tx_bit in
-  let held = tx_fab &: bit fabctl 9 &: role fabctl.:[8, 5] in
+  let line = mux2 tx_fab (role fabctl.:[3, 1]) tx_bit in
+  let held = tx_fab &: bit fabctl 9 &: role fabctl.:[7, 5] in
   let consume = have_bit &: ~:held in
   let tx_level = mux2 have_bit line (bit txcfg 11) in
   (* 5. RX *)
   let rx_go = rx_tick &: rx_active.value in
-  let rx_b = mux2 rx_fab (role fabctl.:[13, 10]) rx_sample in
-  let dropped = rx_fab &: bit fabctl2 4 &: role fabctl2.:[3, 0] in
+  let rx_b = mux2 rx_fab (role fabctl.:[12, 10]) rx_sample in
+  let dropped = rx_fab &: bit fabctl2 4 &: role fabctl2.:[2, 0] in
   let keep = rx_go &: ~:dropped in
   let shift_new =
     mux2
@@ -532,7 +547,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let rx_take = exec &: sys 8 &: rx_ready.value in
   (* 6. CRC *)
   let crc_src = crcctl.:[2, 1] in
-  let crc_bit = mux crc_src [ tx_bit; rx_b; role fabctl2.:[12, 9]; role fabctl2.:[12, 9] ] in
+  let crc_bit = mux crc_src [ tx_bit; rx_b; role fabctl2.:[11, 9]; role fabctl2.:[11, 9] ] in
   let crc_go =
     bit crcctl 0 &: mux crc_src [ consume; keep; tx_tick; tx_tick ]
   in
@@ -586,7 +601,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
             [ rx_shift <-- shift_new; rx_count <-- count_new ]
         ]
     ; (* fabric *)
-      when_ (tx_tick |: rx_tick) [ flag_latch <-- role fabctl2.:[8, 5] ]
+      when_ (tx_tick |: rx_tick) [ flag_latch <-- role fabctl2.:[7, 5] ]
     ]
     @ List.init n_le ~f:(fun k ->
       let on_rx = Fab.rx_clocked fab_cfg.(k) in
@@ -651,7 +666,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
        ; List.map csrs ~f:(fun (addr, mask, v) ->
            when_
              (csr_we &: (caddr ==:. addr))
-             [ v <-- (csr_wval &:. mask).:[width_of_mask mask - 1, 0] ])
+             [ v <-- gather mask csr_wval ])
        ; fifo_update in_count in_e0 in_e1 ~push:i.host_wr ~data:i.host_data ~pop:in_pop
        ; fifo_update
            out_count

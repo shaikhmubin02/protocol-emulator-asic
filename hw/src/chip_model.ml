@@ -19,7 +19,7 @@ let b2i = Bool.to_int
 
 type engine =
   { mem : int array (* program memory *)
-  ; cfg : int array (* 0..15 fabric elements, 16 CRC polynomial, 17 CRC init *)
+  ; cfg : int array (* 0..7 fabric elements, 8..15 unused, 16 CRC polynomial, 17 CRC init *)
   ; mutable model : Model.t option (* None while the engine is held in reset *)
   ; mutable sram_addr : int (* address the program SRAM took at the last edge *)
   ; mutable room : bool (* inbox had room / outbox had a word, one cycle ago *)
@@ -160,7 +160,7 @@ let read_value t =
 
 let fresh_model en =
   let m = Model.create en.mem in
-  Model.set_fabric m (Array.sub en.cfg ~pos:0 ~len:16);
+  Model.set_fabric m (Array.sub en.cfg ~pos:0 ~len:Model.n_le);
   Model.set_crc m ~poly:en.cfg.(16) ~init:en.cfg.(17);
   m
 ;;

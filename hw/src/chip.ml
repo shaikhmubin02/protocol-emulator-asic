@@ -14,7 +14,7 @@
      region 0  program memory, offset = word address. Write and read only while the engine is
                stopped.
      region 1  configuration, offset = 2 * word + half. Writing the low half holds it; writing
-               the high half stores the 32-bit word (0..15 fabric elements, 16 CRC polynomial,
+               the high half stores the 32-bit word (0..7 fabric elements, 16 CRC polynomial,
                17 CRC init). Write only.
      region 2  0x00 status (read): [7:0] pc, [8] halted, [9] running, [11:10] inbox count,
                     [13:12] outbox count, [14] bit engine on

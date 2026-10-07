@@ -18,7 +18,7 @@ open! Hardcaml
 
 exception Illegal_instruction of int * int
 
-let n_le = 16
+let n_le = 8
 
 module Fab = Fabric_logic.Make (Bits)
 
@@ -567,7 +567,7 @@ let tick t ~tx_tick ~rx_tick =
       fun i -> Bits.to_bool out.(i))
     else fun _ -> false
   in
-  be.flag_latch <- role (field fc2 ~hi:8 ~lo:5);
+  be.flag_latch <- role (field fc2 ~hi:7 ~lo:5);
   (* 4. TX pin *)
   let tx_pin = field tx ~hi:9 ~lo:5 in
   let consumed =
@@ -576,9 +576,9 @@ let tick t ~tx_tick ~rx_tick =
     else (
       match tx_bit with
       | Some b ->
-        let line = if tx_fab then role (field fc ~hi:4 ~lo:1) else b = 1 in
+        let line = if tx_fab then role (field fc ~hi:3 ~lo:1) else b = 1 in
         drive t tx_pin line;
-        let held = tx_fab && field fc ~hi:9 ~lo:9 = 1 && role (field fc ~hi:8 ~lo:5) in
+        let held = tx_fab && field fc ~hi:9 ~lo:9 = 1 && role (field fc ~hi:7 ~lo:5) in
         if held
         then None
         else (
@@ -594,8 +594,8 @@ let tick t ~tx_tick ~rx_tick =
     if not (rx_tick && be.rx_active)
     then None
     else (
-      let b = if rx_fab then Bool.to_int (role (field fc ~hi:13 ~lo:10)) else rx_sample in
-      let dropped = rx_fab && field fc2 ~hi:4 ~lo:4 = 1 && role (field fc2 ~hi:3 ~lo:0) in
+      let b = if rx_fab then Bool.to_int (role (field fc ~hi:12 ~lo:10)) else rx_sample in
+      let dropped = rx_fab && field fc2 ~hi:4 ~lo:4 = 1 && role (field fc2 ~hi:2 ~lo:0) in
       if dropped
       then None
       else (
@@ -623,7 +623,7 @@ let tick t ~tx_tick ~rx_tick =
     match field t.csr.(Isa.Csr.crcctl) ~hi:2 ~lo:1 with
     | 0 -> Option.iter consumed ~f:(crc_step t)
     | 1 -> Option.iter kept ~f:(crc_step t)
-    | _ -> if tx_tick then crc_step t (Bool.to_int (role (field fc2 ~hi:12 ~lo:9))))
+    | _ -> if tx_tick then crc_step t (Bool.to_int (role (field fc2 ~hi:11 ~lo:9))))
 ;;
 
 let advance_baud t =
