@@ -1,4 +1,4 @@
-(* Prints the Verilog for the chip. Usage: generate.exe [chip|seq|fabric] [asic|sim] *)
+(* Prints the Verilog for the chip. Usage: generate.exe [chip|chip2|seq|fabric] [asic|sim] *)
 
 open! Core
 open! Hardcaml
@@ -9,7 +9,9 @@ let () =
   let mode = if has "sim" then Pemu.Cfg_store.Sim else Pemu.Cfg_store.Asic in
   let scope = Scope.create ~flatten_design:false () in
   let circuit =
-    if has "chip"
+    if has "chip2"
+    then Pemu.Chip.circuit ~n_engines:2 Pemu.Chip.Asic scope
+    else if has "chip"
     then Pemu.Chip.circuit Pemu.Chip.Asic scope
     else if has "fabric"
     then Pemu.Spike_top.circuit mode

@@ -50,7 +50,8 @@ let bit x k = x.:[k, k]
 
 module Engine_in_scope = Hierarchy.In_scope (Engine.I) (Engine.O)
 
-let create mode scope (i : _ I.t) : _ O.t =
+(* [n_engines] below 4 is for area experiments; the address map stays the same *)
+let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
   let spec = Reg_spec.create ~clock:i.clk ~reset:i.rst_n ~reset_level:Low () in
   let pin k = i.ui_in.:[k, k] in
   let sync x = reg spec (reg spec x) in
@@ -225,7 +226,7 @@ let create mode scope (i : _ I.t) : _ O.t =
   { O.uo_out = miso @: out.:[14, 8]; uio_out = out.:[7, 0]; uio_oe = oe.:[7, 0] }
 ;;
 
-let circuit mode scope =
+let circuit ?n_engines mode scope =
   let module C = Circuit.With_interface (I) (O) in
-  C.create_exn ~name:"tt_um_shaikhmubin02_pemu" (create mode scope)
+  C.create_exn ~name:"tt_um_shaikhmubin02_pemu" (create ?n_engines mode scope)
 ;;
