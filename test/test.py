@@ -131,7 +131,7 @@ async def test_reset_state(dut):
 async def test_program_readback(dut):
     b = await start(dut)
     rng = random.Random(7)
-    words = {e: [rng.randrange(0x10000) for _ in range(8)] for e in (0, 3)}
+    words = {e: [rng.randrange(0x10000) for _ in range(8)] for e in (0, 1)}
     for e, w in words.items():
         await b.write(program(e, 200), w)
     for e, w in words.items():

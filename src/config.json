@@ -10,10 +10,8 @@
   "MACROS": {
     "RM_IHPSG13_1P_256x16_c2_bm_bist": {
       "instances": {
-        "engine0.sram": { "location": [57.215, 37.8], "orientation": "R0" },
-        "engine1.sram": { "location": [357.215, 37.8], "orientation": "R0" },
-        "engine2.sram": { "location": [657.215, 37.8], "orientation": "R0" },
-        "engine3.sram": { "location": [957.215, 37.8], "orientation": "R0" }
+        "engine0.sram": { "location": [357.215, 37.8], "orientation": "R0" },
+        "engine1.sram": { "location": [757.215, 37.8], "orientation": "R0" }
       },
       "gds": ["dir::../macro/RM_IHPSG13_1P_256x16_c2_bm_bist/RM_IHPSG13_1P_256x16_c2_bm_bist.gds"],
       "lef": ["dir::../macro/RM_IHPSG13_1P_256x16_c2_bm_bist/RM_IHPSG13_1P_256x16_c2_bm_bist.lef"],
@@ -27,8 +25,8 @@
     }
   },
   "PDN_MACRO_CONNECTIONS": [
-    "engine[0-3].sram VPWR VGND VDD! VSS!",
-    "engine[0-3].sram VPWR VGND VDDARRAY! VSS!"
+    "engine[0-1].sram VPWR VGND VDD! VSS!",
+    "engine[0-1].sram VPWR VGND VDDARRAY! VSS!"
   ],
   "PDN_CFG": "dir::pdn_cfg.tcl",
   "PDN_VERTICAL_LAYER": "Metal4",
