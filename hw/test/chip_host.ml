@@ -2,7 +2,8 @@
    plus whatever is wired to the protocol pins.
 
    [on_cycle] runs after every clock cycle; tests use it to wire outputs back to inputs or to play
-   a device. ui[7:3] come from [ui], the uio pads read [uio_ext] where no engine drives them. *)
+   a device. [before_edge] runs once the cycle's inputs are set, just before the clock edge.
+   ui[7:3] come from [ui], the uio pads read [uio_ext] where no engine drives them. *)
 
 open! Core
 open Hardcaml
@@ -21,6 +22,7 @@ type t =
   ; mutable uio_ext : int
   ; mutable cycle : int
   ; mutable on_cycle : t -> unit
+  ; mutable before_edge : t -> unit
   }
 
 let get r = Bits.to_int_trunc !r
@@ -35,6 +37,7 @@ let uio_pads t = uio_out t land uio_oe t lor (t.uio_ext land lnot (uio_oe t)) la
 let cycle t =
   set t.i.ui_in 8 ((t.ui land 0xf8) lor (t.mosi lsl 2) lor (t.cs_n lsl 1) lor t.sck);
   set t.i.uio_in 8 (uio_pads t);
+  t.before_edge t;
   Cyclesim.cycle t.sim;
   t.cycle <- t.cycle + 1;
   t.on_cycle t
@@ -60,12 +63,16 @@ let create () =
     ; uio_ext = 0
     ; cycle = 0
     ; on_cycle = (fun _ -> ())
+    ; before_edge = (fun _ -> ())
     }
   in
   set t.i.ena 1 1;
   set t.i.rst_n 1 0;
   cycles t 3;
   set t.i.rst_n 1 1;
+  (* Cyclesim doesn't act on the asynchronous reset input; this puts every register at its reset
+     value, as the pin does on the chip *)
+  Cyclesim.reset sim;
   t
 ;;
 

@@ -84,6 +84,8 @@ type t =
   ; mutable time : int
   ; mutable time_hi_latch : int
   ; flags : bool array
+  ; mutable flag_set : int (* flags this cycle's instruction set / cleared, for the chip *)
+  ; mutable flag_clr : int
   ; out : bool array
   ; oe : bool array
   ; owned : bool array
@@ -121,6 +123,8 @@ let create ?(mailbox_depth = 2) program =
   ; time = 0
   ; time_hi_latch = 0
   ; flags = Array.create ~len:8 false
+  ; flag_set = 0
+  ; flag_clr = 0
   ; out = Array.create ~len:32 false
   ; oe = Array.create ~len:32 false
   ; owned = Array.init 32 ~f:(fun p -> p < 15)
@@ -407,9 +411,11 @@ let execute t =
       ~on_done:(fun () -> r.(d) <- Queue.dequeue_exn t.to_engine land mask16)
   | Sig f ->
     t.flags.(f) <- true;
+    t.flag_set <- 1 lsl f;
     goto next
   | Clrf f ->
     t.flags.(f) <- false;
+    t.flag_clr <- 1 lsl f;
     goto next
   | Tx s ->
     wait_step t ~ready:(Option.is_none t.be.hold) ~on_done:(fun () -> p.p_tx <- Some r.(s))
@@ -709,6 +715,8 @@ let input_events t ~capcfg ~rx ~baud ~period ~enabled =
 
 let step t (pads : Pads.t) =
   t.be.completed <- false;
+  t.flag_set <- 0;
+  t.flag_clr <- 0;
   let capcfg = t.csr.(Isa.Csr.capcfg)
   and rx = rxcfg t
   and baud = t.csr.(Isa.Csr.baud)
