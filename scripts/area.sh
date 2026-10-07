@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")/../hw"
 eval "$(opam env --switch=5.2.0+ox)"
-dune build -j 2 2>&1 | head -20
+dune build -j 2 2>&1 | head -20; [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "build failed"; exit 1; }
 tmp=$(mktemp -d)
 ./_build/default/bin/generate.exe chip > "$tmp/chip.v"
 cat > "$tmp/bb.v" <<'V'

@@ -280,10 +280,15 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let baud = csr_value Isa.Csr.baud in
   let baud_eff = mux2 (baud ==:. 0) (one 16) baud in
   let period = baud_eff @: csr_value Isa.Csr.baudf in
-  let fires acc = be_en.value &: (uresize acc ~width:25 +:. 256 >=: uresize period ~width:25) in
-  let tx_tick = fires acc_tx.value
-  and rx_tick = fires acc_rx.value in
-  let advance acc tick = mux2 tick (acc +:. 256 -: period) (acc +:. 256) in
+  (* A + 256 >= P and A + 256 - P from one subtraction: the tick is its sign *)
+  let baud_step acc =
+    let up = uresize acc ~width:25 +: (one 17 @: zero 8) in
+    let over = up -: uresize period ~width:25 in
+    let tick = be_en.value &: ~:(msb over) in
+    tick, mux2 tick over.:[23, 0] up.:[23, 0]
+  in
+  let tx_tick, tx_next = baud_step acc_tx.value
+  and rx_tick, rx_next = baud_step acc_rx.value in
   (* ---------- waits ---------- *)
   let wait_kind = f 11 10 in
   let wait_ready =
@@ -372,7 +377,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
       ]
       @ List.map csrs ~f:(fun (a, mask, v) -> a, uresize (scatter mask v.value) ~width:16)
     in
-    List.fold named ~init:(zero 16) ~f:(fun acc (a, v) -> mux2 (caddr ==:. a) v acc)
+    mux caddr (List.init 64 ~f:(fun a -> Option.value (List.Assoc.find named a ~equal:Int.equal) ~default:(zero 16)))
   in
   (* ---------- write-back ---------- *)
   let wb_idx = mux2 (is 0) (f 2 0) (f 11 9) in
@@ -483,10 +488,11 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
     ; when_ (push &: (pos ==:. 1)) [ e1 <-- data ]
     ]
   in
+  let pin_hot = binary_to_onehot pin_p in
   let per_pin q =
     let owned = bit i.owned q in
     (* PIN *)
-    let pin_hit = exec &: is 7 &: (pin_mode <>:. 3) &: (pin_p ==:. q) &: owned in
+    let pin_hit = exec &: is 7 &: (pin_mode <>:. 3) &: bit pin_hot q &: owned in
     (* OUTG *)
     let outg_hit = exec &: is 8 &: bit outg_mask q &: owned in
     let hiz_value_out, hiz_value_oe = if q < 8 then out_now q, gnd else gnd, vdd in
@@ -507,7 +513,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   and crcctl = csr_value Isa.Csr.crcctl in
   let n_tx = uresize txcfg.:[3, 0] ~width:5 +:. 1
   and n_rx = uresize rxcfg.:[3, 0] ~width:5 +:. 1 in
-  let tx_pin = txcfg.:[9, 5]
+  let tx_pin_hot = binary_to_onehot txcfg.:[9, 5]
   and tx_fab = bit txcfg 10
   and rx_pin = rxcfg.:[9, 5]
   and rx_fab = bit rxcfg 10
@@ -569,17 +575,17 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   in
   let start_fire = be_en.value &: ~:rx_active_post &: (rx_start <>:. 0) &: rx_edge in
   let realign = be_en.value &: rx_active_post &: bit rxcfg 11 &: (rx_was ^: rx_will) in
-  let half = period -: (uresize (srl baud_eff ~by:1) ~width:16 @: zero 8) in
+  let half = (srl baud_eff ~by:1 +: uresize (lsb baud_eff) ~width:16) @: csr_value Isa.Csr.baudf in
   let ben = exec &: sys 10 in
   let ben_on = f 0 0 in
   let tx_drive q =
     when_
-      (tx_tick &: (tx_pin ==:. q) &: bit i.owned q)
+      (tx_tick &: bit tx_pin_hot q &: bit i.owned q)
       [ out.(q) <-- tx_level; oe.(q) <-- vdd ]
   in
   let bit_engine_updates =
     [ when_ be_en.value
-        [ acc_tx <-- advance acc_tx.value tx_tick; acc_rx <-- advance acc_rx.value rx_tick ]
+        [ acc_tx <-- tx_next; acc_rx <-- rx_next ]
     ; (* TX *)
       when_ load [ hold_v <-- gnd ]
     ; when_ (exec &: sys 7 &: ~:(hold_v.value)) [ hold <-- reg_c; hold_v <-- vdd ]
