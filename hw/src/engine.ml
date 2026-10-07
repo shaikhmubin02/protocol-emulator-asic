@@ -114,7 +114,10 @@ module Fab = Fabric_logic.Make (Signal)
 
 let n_le = 8
 
-let create (mode : Mode.t) (i : _ I.t) : _ O.t =
+(* [lite]: no LUT fabric and no CRC unit (see Isa.Csr.writable_lite). The logic is still
+   described, but with no configuration storage and those CSRs absent its inputs are constant,
+   so synthesis removes it. *)
+let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   let cfg_spec = Reg_spec.create ~clock:i.clock ~reset:i.rst_n ~reset_level:Low () in
   (* while run is low the engine sits in reset; program memory and config are kept *)
   let spec = Reg_spec.override cfg_spec ~clear:~:(i.run) in
@@ -156,10 +159,14 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let flag k = bit i.ev_flags k in
   let flag_list = List.init 8 ~f:flag in
   let time = i.time in
-  let csrs = List.map Isa.Csr.writable ~f:(fun (addr, mask) -> addr, mask, var (width_of_mask mask)) in
+  let csrs =
+    List.map (Isa.Csr.writable_for ~lite) ~f:(fun (addr, mask) -> addr, mask, var (width_of_mask mask))
+  in
+  (* CSRs this engine doesn't have read 0 *)
   let csr_value addr =
-    let _, mask, v = List.find_exn csrs ~f:(fun (a, _, _) -> a = addr) in
-    scatter mask v.value
+    match List.find csrs ~f:(fun (a, _, _) -> a = addr) with
+    | Some (_, mask, v) -> scatter mask v.value
+    | None -> zero 16
   in
   (* mailboxes: 2-deep FIFOs, head in e0 *)
   let fifo () = var 2, var 16, var 16 in
@@ -184,13 +191,16 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   and flag_latch = var 1 in
   let fab_q = Array.init n_le ~f:(fun _ -> var 1) in
   let cfg_word addr ~width =
+    if lite
+    then zero width
+    else (
     let init = Option.map (init_of addr) ~f:(Bits.of_int_trunc ~width) in
     Cfg_store.create
       cfg_mode
       ?init
       ~spec:cfg_spec
       ~we:(i.cfg_we &: (i.cfg_addr ==:. addr))
-      ~d:i.cfg_data.:[width - 1, 0]
+      ~d:i.cfg_data.:[width - 1, 0])
   in
   let fab_cfg = Array.init n_le ~f:(fun k -> cfg_word k ~width:Fabric_logic.cfg_bits) in
   let crc_poly = cfg_word 16 ~width:32 in
@@ -705,7 +715,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   }
 ;;
 
-let circuit mode =
+let circuit ?lite mode =
   let module C = Circuit.With_interface (I) (O) in
-  C.create_exn ~name:"engine" (create mode)
+  C.create_exn ~name:"engine" (create ?lite mode)
 ;;

@@ -13,7 +13,7 @@
    Address: [15:14] engine, [13:12] region, [11:0] offset.
      region 0  program memory, offset = word address. Write and read only while the engine is
                stopped.
-     region 1  configuration, offset = 2 * word + half. Writing the low half holds it; writing
+     region 1  configuration (engines 0 and 1 only), offset = 2 * word + half. Writing the low half holds it; writing
                the high half stores the 32-bit word (0..7 fabric elements, 16 CRC polynomial,
                17 CRC init). Write only.
      region 2  0x00 status (read): [7:0] pc, [8] halted, [9] running, [11:10] inbox count,
@@ -44,6 +44,10 @@ type mode =
   | Sim
 
 let n_engines = 4
+
+(* engines 0 and 1 are full; the others are lite: no LUT fabric, no CRC unit *)
+let n_full = 2
+let lite e = e >= n_full
 let n_pins = 15
 let chip_id = 0x5045
 let bit x k = x.:[k, k]
@@ -107,10 +111,10 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
       let mailbox_room = reg spec (inbox_count.(e) <:. 2) in
       let r_this_region k = (r_engine ==:. e) &: (r_region ==:. k) in
       Engine_in_scope.hierarchical
-        ~name:"engine"
+        ~name:(if lite e then "engine_lite" else "engine")
         ~instance:(sprintf "engine%d" e)
         ~scope
-        (fun _scope i -> Engine.create engine_mode i)
+        (fun _scope i -> Engine.create ~lite:(lite e) engine_mode i)
         { Engine.I.clock = i.clk
         ; rst_n = i.rst_n
         ; uio_in = i.uio_in

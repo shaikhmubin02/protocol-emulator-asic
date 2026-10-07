@@ -18,8 +18,8 @@ type t =
   ; mutable flags : int (* the chip-level flag register, kept here *)
   }
 
-let create ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) program =
-  let sim = Sim.create (Engine.create (Engine.Mode.sim ~fabric ~crc_poly ~crc_init program)) in
+let create ?(lite = false) ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) program =
+  let sim = Sim.create (Engine.create ~lite (Engine.Mode.sim ~fabric ~crc_poly ~crc_init program)) in
   let i = Cyclesim.inputs sim
   and o = Cyclesim.outputs sim
   and before = Cyclesim.outputs ~clock_edge:Before sim in
@@ -28,7 +28,7 @@ let create ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) program =
   set i.run 1 1;
   set i.owned 15 0x7fff;
   set i.cfg_we 1 0;
-  let model = Model.create program in
+  let model = Model.create ~lite program in
   Model.set_fabric model fabric;
   Model.set_crc model ~poly:crc_poly ~init:crc_init;
   { sim; i; o; before; model; program; cycle = 0; flags = 0 }

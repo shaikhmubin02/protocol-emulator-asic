@@ -69,6 +69,8 @@ type pending =
 
 type t =
   { program : int array
+  ; lite : bool (* no LUT fabric, no CRC unit (Isa.Csr.writable_lite) *)
+  ; writable : (int * int) list
   ; regs : int array
   ; mutable pc : int
   ; mutable z : bool
@@ -103,11 +105,13 @@ type t =
 let mask16 = 0xffff
 let mask32 = 0xffff_ffff
 
-let create ?(mailbox_depth = 2) program =
+let create ?(lite = false) ?(mailbox_depth = 2) program =
   if Array.length program > 256 then invalid_arg "program longer than 256 words";
   let words = Array.create ~len:256 0 in
   Array.blit ~src:program ~src_pos:0 ~dst:words ~dst_pos:0 ~len:(Array.length program);
   { program = words
+  ; lite
+  ; writable = Isa.Csr.writable_for ~lite
   ; regs = Array.create ~len:8 0
   ; pc = 0
   ; z = false
@@ -164,13 +168,17 @@ let create ?(mailbox_depth = 2) program =
 (* ---- host side configuration ---- *)
 
 let set_fabric t words =
+  if not t.lite
+  then
   Array.iteri words ~f:(fun i w ->
     t.be.fab_cfg.(i) <- Bits.of_int_trunc ~width:Fabric_logic.cfg_bits w)
 ;;
 
 let set_crc t ~poly ~init =
-  t.be.crc_poly <- poly land mask32;
-  t.be.crc_init <- init land mask32
+  if not t.lite
+  then (
+    t.be.crc_poly <- poly land mask32;
+    t.be.crc_init <- init land mask32)
 ;;
 
 (* ---- pins ---- *)
@@ -260,7 +268,7 @@ let read_csr t c =
   then crc_view t land mask16
   else if c = Isa.Csr.crc_hi
   then (crc_view t lsr 16) land mask16
-  else if List.Assoc.mem Isa.Csr.writable c ~equal:Int.equal
+  else if List.Assoc.mem t.writable c ~equal:Int.equal
   then t.csr.(c)
   else 0
 ;;
@@ -389,7 +397,7 @@ let execute t =
   let p = t.pend in
   let goto pc = finish t ~next_pc:pc ~extra:0 in
   let csr_write c v =
-    match List.Assoc.find Isa.Csr.writable c ~equal:Int.equal with
+    match List.Assoc.find t.writable c ~equal:Int.equal with
     | Some mask -> p.p_csr <- (c, v land mask) :: p.p_csr
     | None -> ()
   in

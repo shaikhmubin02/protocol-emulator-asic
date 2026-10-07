@@ -7,8 +7,11 @@ This file is used to generate your project datasheet.
 The chip has four small engines. Each one is a processor built for talking to pins: every
 instruction takes a known number of clock cycles, so a program can produce or check a waveform
 down to the exact cycle. Each engine has its own 256-word program memory, eight 16-bit registers
-and a bit engine (baud generator, TX and RX shifters, a 16-element LUT fabric for bit-level coding
-such as bit stuffing or NRZI, and a CRC unit up to 32 bits).
+and a bit engine (baud generator, TX and RX shifters).
+
+Engines 0 and 1 also have an 8-element LUT fabric for bit-level coding such as bit stuffing or
+NRZI, and a CRC unit up to 32 bits. Those are for protocols like USB and Ethernet. Engines 2 and 3
+leave them out to save area; UART, SPI, I2C, JTAG and the like run on any engine.
 
 The engines share a 32-bit cycle counter and eight event flags, so they can start together or
 wait for each other. Pins 0 to 14 (uio[7:0] and uo[6:0]) each have an owner: the host decides
@@ -26,7 +29,7 @@ Address bits [15:14] pick the engine and [13:12] the region:
 | Region | Offset | What |
 |---|---|---|
 | 0 | 0x00-0xff | program memory (while the engine is stopped) |
-| 1 | 2 x word + half | fabric and CRC configuration: low half, then high half |
+| 1 | 2 x word + half | fabric and CRC configuration, engines 0 and 1: low half, then high half |
 | 2 | 0x00 | status: [7:0] pc, [8] halted, [9] running, [11:10] inbox, [13:12] outbox, [14] bit engine on |
 | 2 | 0x10-0x17 | registers r0-r7 |
 | 2 | 0x80-0xff | mailbox: write to the inbox, read from the outbox |

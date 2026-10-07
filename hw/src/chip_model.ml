@@ -18,7 +18,8 @@ let bit v k = (v lsr k) land 1 = 1
 let b2i = Bool.to_int
 
 type engine =
-  { mem : int array (* program memory *)
+  { lite : bool (* no LUT fabric, no CRC unit, no configuration *)
+  ; mem : int array (* program memory *)
   ; cfg : int array (* 0..7 fabric elements, 8..15 unused, 16 CRC polynomial, 17 CRC init *)
   ; mutable model : Model.t option (* None while the engine is held in reset *)
   ; mutable sram_addr : int (* address the program SRAM took at the last edge *)
@@ -53,8 +54,9 @@ type t =
 
 let create () =
   { engines =
-      Array.init n_engines ~f:(fun _ ->
-        { mem = Array.create ~len:256 0
+      Array.init n_engines ~f:(fun e ->
+        { lite = e >= 2
+        ; mem = Array.create ~len:256 0
         ; cfg = Array.create ~len:n_cfg 0
         ; model = None
         ; sram_addr = 0
@@ -159,7 +161,7 @@ let read_value t =
 ;;
 
 let fresh_model en =
-  let m = Model.create en.mem in
+  let m = Model.create ~lite:en.lite en.mem in
   Model.set_fabric m (Array.sub en.cfg ~pos:0 ~len:Model.n_le);
   Model.set_crc m ~poly:en.cfg.(16) ~init:en.cfg.(17);
   m
@@ -236,7 +238,7 @@ let step t (pads : Model.Pads.t) =
     en.has <- outbox_before <> 0);
   (* configuration writes (stored now, loaded into the engine when it starts) *)
   let cfg_index = (w_off lsr 1) land 31 in
-  if t.wr && w_region = 1 && bit w_off 0 && cfg_index < n_cfg
+  if t.wr && w_region = 1 && bit w_off 0 && cfg_index < n_cfg && not t.engines.(w_engine).lite
   then (
     let en = t.engines.(w_engine) in
     if running t w_engine then failwith "chip model: configuration write to a running engine";

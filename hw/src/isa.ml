@@ -403,6 +403,19 @@ module Csr = struct
     ]
   ;;
 
+  (* A lite engine has no LUT fabric and no CRC unit: FABCTL, FABCTL2 and CRCCTL don't exist
+     (they read 0) and the "through fabric" bit of TXCFG/RXCFG isn't kept. *)
+  let writable_lite =
+    List.filter_map writable ~f:(fun (c, mask) ->
+      if c = fabctl || c = fabctl2 || c = crcctl
+      then None
+      else if c = txcfg || c = rxcfg
+      then Some (c, mask land lnot 0x400)
+      else Some (c, mask))
+  ;;
+
+  let writable_for ~lite = if lite then writable_lite else writable
+
   let names =
     [ "time_lo", time_lo
     ; "time_hi", time_hi

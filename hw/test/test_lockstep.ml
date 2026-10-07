@@ -6,13 +6,13 @@ let bit v k = (v lsr k) land 1
 (* how much of the bit engine the random programs reach *)
 let coverage = Array.create ~len:8 0
 
-let run_random ~seed ~cycles =
+let run_random ?(lite = false) ~seed ~cycles () =
   let rng = Random.State.make [| seed |] in
   let program = Random_program.create rng in
   let fabric = Array.init Model.n_le ~f:(fun _ -> Random.State.int rng (1 lsl Fabric_logic.cfg_bits)) in
   let crc_poly = Random.State.int rng 0x1_0000_0000
   and crc_init = Random.State.int rng 0x1_0000_0000 in
-  let ls = Lockstep.create ~fabric ~crc_poly ~crc_init program in
+  let ls = Lockstep.create ~lite ~fabric ~crc_poly ~crc_init program in
   for _ = 1 to cycles do
     let pads = { Model.Pads.uio_in = Random.State.int rng 256; ui_in = Random.State.int rng 256 } in
     let send = if Random.State.int rng 4 = 0 then Some (Random.State.int rng 0x10000) else None in
@@ -48,7 +48,7 @@ let%expect_test "random programs: RTL = model every cycle" =
   let programs = 300
   and cycles = 2000 in
   for seed = 1 to programs do
-    try run_random ~seed ~cycles with
+    try run_random ~seed ~cycles () with
     | Lockstep.Mismatch s -> raise_s [%message "seed" (seed : int) (s : Sexp.t)]
   done;
   printf "%d random programs x %d cycles: no difference\n" programs cycles;
@@ -174,4 +174,15 @@ loop: pull r0
   done;
   printf "%d cycles in lockstep, %d bytes left unsent\n" ls.cycle (Queue.length pending);
   [%expect {| 600 cycles in lockstep, 0 bytes left unsent |}]
+;;
+
+let%expect_test "random programs on a lite engine (no fabric, no CRC)" =
+  let programs = 150 in
+  for seed = 1001 to 1000 + programs do
+    try run_random ~lite:true ~seed ~cycles:2000 () with
+    | Lockstep.Mismatch s -> raise_s [%message "seed" (seed : int) (s : Sexp.t)]
+  done;
+  printf "%d random programs x 2000 cycles on a lite engine: no difference
+" programs;
+  [%expect {| |}]
 ;;
