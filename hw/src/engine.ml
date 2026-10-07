@@ -82,6 +82,9 @@ let rotl17 v m =
   List.foldi (bits_lsb m) ~init:v ~f:(fun k acc b -> mux2 b (rotl acc ~by:(1 lsl k)) acc)
 ;;
 
+(* [width] bits, bit j set when j < k *)
+let below k ~width = concat_lsb (List.init width ~f:(fun j -> of_int_trunc ~width:(Signal.width k) j <: k))
+
 let mod17 n =
   (* n is 6 bits *)
   let n7 = uresize n ~width:7 in
@@ -228,26 +231,31 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   (* ---------- ALU ---------- *)
   let a = reg_a
   and b = reg_b in
-  let sum = uresize a ~width:17 +: uresize b ~width:17 in
-  let diff = a -: b in
-  let borrow = a <: b in
+  let n16 = uresize imm6 ~width:16 in
+  (* one adder and one subtractor serve ADD/SUB/CMP and their immediate forms *)
+  let y = mux2 (is 3) n16 b in
+  let sum = uresize a ~width:17 +: uresize y ~width:17 in
+  let diff17 = uresize a ~width:17 -: uresize y ~width:17 in
+  let diff = diff17.:[15, 0] in
+  let borrow = msb diff17 in
   let alu_fn = f 5 3 in
   let alu_res = mux alu_fn [ b; sum.:[15, 0]; diff; a &: b; a |: b; a ^: b; diff; a &: b ] in
   let alu_writes = alu_fn <:. 6 in
-  let n16 = uresize imm6 ~width:16 in
-  let sumi = uresize a ~width:17 +: uresize n16 ~width:17 in
-  let diffi = a -: n16 in
-  let borrowi = a <: n16 in
-  let shl = log_shift ~f:sll (uresize a ~width:32) ~by:imm6 in
-  let shr = log_shift ~f:srl (a @: zero 16) ~by:imm6 in
-  let m = mod17 imm6 in
-  let rl = rotl17 (c.value @: a) m in
-  let rr = rotl17 (c.value @: a) (mux2 (m ==:. 0) (zero 5) (of_int_trunc ~width:5 17 -: m)) in
   let alui_fn = f 8 6 in
+  (* SHLI, SHRI, RLC and RRC share one 17-bit rotator. A shift is a rotation of {0, a} with
+     the bits that wrapped around cleared; the carry lands in bit 16 either way. *)
+  let m = mod17 imm6 in
+  let big = imm6 >=:. 17 in
+  let rotating = (alui_fn ==:. 5) |: (alui_fn ==:. 6) in
+  let left = (alui_fn ==:. 3) |: (alui_fn ==:. 5) in
+  let seventeen = of_int_trunc ~width:5 17 in
+  let amount = mux2 left m (mux2 (m ==:. 0) (zero 5) (seventeen -: m)) in
+  let rot = rotl17 (mux2 rotating c.value gnd @: a) amount in
+  let shl = mux2 big (zero 16) (rot.:[15, 0] &: ~:(below m ~width:16)) in
+  let shr = mux2 big (zero 16) (rot.:[15, 0] &: below (seventeen -: m) ~width:16) in
+  let shift_carry = mux2 (imm6 ==:. 0) c.value (~:big &: rot.:[16, 16]) in
   let alui_res =
-    mux
-      alui_fn
-      [ sumi.:[15, 0]; diffi; diffi; shl.:[15, 0]; shr.:[31, 16]; rl.:[15, 0]; rr.:[15, 0]; a ]
+    mux alui_fn [ sum.:[15, 0]; diff; diff; shl; shr; rot.:[15, 0]; rot.:[15, 0]; a ]
   in
   let alui_writes = ~:((alui_fn ==:. 2) |: (alui_fn ==:. 7)) in
   let tstb_zero = ~:(mux imm6.:[3, 0] (bits_lsb a)) in
@@ -370,11 +378,8 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   let wb_idx = mux2 (is 0) (f 2 0) (f 11 9) in
   let inp_value =
     let base, count = group (f 8 7) in
-    List.init 8 ~f:(fun k ->
-      (of_int_trunc ~width:4 k <: count)
-      &: read_pin (uresize base ~width:6 +:. k))
-    |> concat_lsb
-    |> uresize ~width:16
+    let window = log_shift ~f:srl (uresize pin_vec.:[31, 0] ~width:40) ~by:base in
+    uresize (window.:[7, 0] &: below count ~width:8) ~width:16
   in
   let wb_val =
     mux
@@ -416,20 +421,20 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
       (mux2
          (is 2)
          (mux2 (alu_fn ==:. 6) (diff ==:. 0) (mux2 (alu_fn ==:. 7) ((a &: b) ==:. 0) (alu_res ==:. 0)))
-         (mux2 (alui_fn ==:. 7) tstb_zero (mux2 (alui_fn ==:. 2) (diffi ==:. 0) (alui_res ==:. 0))))
+         (mux2 (alui_fn ==:. 7) tstb_zero (mux2 (alui_fn ==:. 2) (diff ==:. 0) (alui_res ==:. 0))))
   in
   let z_en = exec &: (is 1 |: is 2 |: is 3) in
   let c_new_alu = mux (uresize alu_fn ~width:3) [ c.value; sum.:[16, 16]; borrow; c.value; c.value; c.value; borrow; c.value ] in
   let c_new_alui =
     mux
       alui_fn
-      [ sumi.:[16, 16]
-      ; borrowi
-      ; borrowi
-      ; mux2 (imm6 ==:. 0) c.value shl.:[16, 16]
-      ; mux2 (imm6 ==:. 0) c.value shr.:[15, 15]
-      ; rl.:[16, 16]
-      ; rr.:[16, 16]
+      [ sum.:[16, 16]
+      ; borrow
+      ; borrow
+      ; shift_carry
+      ; shift_carry
+      ; rot.:[16, 16]
+      ; rot.:[16, 16]
       ; c.value
       ]
   in
@@ -452,6 +457,9 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
   in
   let pin_hiz = (pin_mode ==:. 0) &: (pin_op ==:. 3) in
   let outg_base, outg_count = group (f 8 7) in
+  let place v = log_shift ~f:sll (uresize v ~width:40) ~by:outg_base in
+  let outg_bits = place a.:[7, 0]
+  and outg_mask = place (below outg_count ~width:8) in
   (* ---------- the state update ---------- *)
   let in_pop = exec &: sys 4 &: ready in
   let out_push = exec &: sys 3 &: ready in
@@ -480,12 +488,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
     (* PIN *)
     let pin_hit = exec &: is 7 &: (pin_mode <>:. 3) &: (pin_p ==:. q) &: owned in
     (* OUTG *)
-    let base6 = uresize outg_base ~width:6 in
-    let in_range =
-      (of_int_trunc ~width:6 q >=: base6) &: (of_int_trunc ~width:6 q <: base6 +: uresize outg_count ~width:6)
-    in
-    let idx = (of_int_trunc ~width:6 q -: base6).:[2, 0] in
-    let outg_hit = exec &: is 8 &: in_range &: owned in
+    let outg_hit = exec &: is 8 &: bit outg_mask q &: owned in
     let hiz_value_out, hiz_value_oe = if q < 8 then out_now q, gnd else gnd, vdd in
     [ when_ pin_hit
         [ if_
@@ -493,7 +496,7 @@ let create (mode : Mode.t) (i : _ I.t) : _ O.t =
             [ out.(q) <-- hiz_value_out; oe.(q) <-- hiz_value_oe ]
             [ out.(q) <-- pin_value; oe.(q) <-- vdd ]
         ]
-    ; when_ outg_hit [ out.(q) <-- mux idx (bits_lsb a.:[7, 0]); oe.(q) <-- vdd ]
+    ; when_ outg_hit [ out.(q) <-- bit outg_bits q; oe.(q) <-- vdd ]
     ]
   in
   (* ---------- bit engine tick (spec 7.5) ---------- *)
