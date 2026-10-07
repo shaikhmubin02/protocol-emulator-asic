@@ -182,7 +182,6 @@ let%expect_test "random programs on a lite engine (no fabric, no CRC)" =
     try run_random ~lite:true ~seed ~cycles:2000 () with
     | Lockstep.Mismatch s -> raise_s [%message "seed" (seed : int) (s : Sexp.t)]
   done;
-  printf "%d random programs x 2000 cycles on a lite engine: no difference
-" programs;
-  [%expect {| |}]
+  printf "%d random programs x 2000 cycles on a lite engine: no difference\n" programs;
+  [%expect {| 150 random programs x 2000 cycles on a lite engine: no difference |}]
 ;;
