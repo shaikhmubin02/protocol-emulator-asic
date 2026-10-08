@@ -24,9 +24,15 @@ PIN_EDGE_MARGIN_UM = 10.0  # TT precheck: power pins must reach within 10 um of 
 
 
 def macro_power_shapes(inst, layer_name):
-    """Absolute pin shapes of an R0-placed macro on one layer, as {net: [(x0, y0, x1, y1)]}."""
+    """Absolute pin shapes of a macro placed R0 or MX (mirrored top to bottom) on one layer,
+    as {net: [(x0, y0, x1, y1)]}."""
     bbox = inst.getBBox()
     ox, oy = bbox.xMin(), bbox.yMin()
+    height = inst.getMaster().getHeight()
+    orient = str(inst.getOrient())
+    if orient not in ("R0", "MX"):
+        raise SystemExit(f"{inst.getName()}: orientation {orient} not handled")
+    mirrored = orient == "MX"
     shapes = {}
     for mterm in inst.getMaster().getMTerms():
         net = POWER_NETS.get(str(mterm.getSigType()))
@@ -35,8 +41,11 @@ def macro_power_shapes(inst, layer_name):
         for mpin in mterm.getMPins():
             for box in mpin.getGeometry():
                 if box.getTechLayer().getName() == layer_name:
+                    y0, y1 = box.yMin(), box.yMax()
+                    if mirrored:
+                        y0, y1 = height - y1, height - y0
                     shapes.setdefault(net, []).append(
-                        (box.xMin() + ox, box.yMin() + oy, box.xMax() + ox, box.yMax() + oy)
+                        (box.xMin() + ox, y0 + oy, box.xMax() + ox, y1 + oy)
                     )
     return shapes
 
