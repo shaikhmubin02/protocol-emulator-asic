@@ -133,3 +133,102 @@ let%expect_test "mailbox reads one word at a time lose nothing" =
   printf "got %s, outbox left %d\n" (hex got) (H.outbox_count t 0);
   [%expect {| got 0001 0002 0003, outbox left 0 |}]
 ;;
+
+(* Three engines at once, each with its own device on its own pins, all loaded and serviced over
+   the host port: engine 0 is an SPI master in mode 3, engine 1 an I2C master at 400 kHz (taking
+   the clock as 50 MHz) against an EEPROM that stretches the clock, engine 2 (a lite engine) a
+   UART looped back on itself. *)
+let%expect_test "SPI, I2C and UART running at the same time" =
+  let open Devices in
+  let t = H.create () in
+  H.load t 0 (load "spi_master.s");
+  H.load t 1 (load "i2c_master.s");
+  H.load t 2 (load "uart.s");
+  (* pins first: an engine's writes to pins it doesn't own are dropped *)
+  List.iter [ 9; 10; 11 ] ~f:(fun pin -> H.own t ~pin ~engine:0);
+  List.iter [ 0; 1 ] ~f:(fun pin -> H.own t ~pin ~engine:1);
+  H.own t ~pin:8 ~engine:2;
+  H.run t 0b0111;
+  let spi = Spi_target.create ~mode:3 in
+  let eeprom = Eeprom.create ~stretch:100 in
+  let timing = I2c_timing.create () in
+  (* which protocols were mid-transfer in each 1000-cycle window: SPI with CS low, I2C between
+     START and STOP, UART with a frame on the wire *)
+  let windows = Hashtbl.create (module Int) in
+  let active k = Hashtbl.update windows (t.cycle / 1000) ~f:(fun v -> Option.value v ~default:0 lor k) in
+  let prev_uo = ref (H.uo t)
+  and prev_scl = ref 1 in
+  t.uio_ext <- 0xff (* pull-ups *);
+  t.on_cycle
+  <- (fun t ->
+       let uo = H.uo t in
+       Spi_target.step spi ~sck:(bit uo 1) ~mosi:(bit uo 2) ~cs:(bit uo 3);
+       let chip_low p = bit (H.uio_oe t) p = 1 && bit (H.uio_out t) p = 0 in
+       let scl = if chip_low 0 || Eeprom.scl_low eeprom then 0 else 1 in
+       let sda = if chip_low 1 || eeprom.sda_low then 0 else 1 in
+       Eeprom.step eeprom ~scl ~sda;
+       I2c_timing.step timing ~scl ~sda;
+       let released b = if b then 0 else 1 in
+       t.uio_ext
+       <- 0xfc lor released (Eeprom.scl_low eeprom) lor (released eeprom.sda_low lsl 1);
+       (* UART TX (uo[0]) back to RX (ui[3]); MISO to ui[4] *)
+       t.ui <- (t.ui land lnot 0x18) lor ((uo land 1) lsl 3) lor (spi.miso lsl 4);
+       if bit uo 3 = 0 then active 1;
+       if not (Poly.equal eeprom.phase Eeprom.Idle) then active 2;
+       if bit uo 0 <> bit !prev_uo 0 then active 4;
+       prev_uo := uo;
+       prev_scl := scl);
+  let spi_data = List.init 12 ~f:(fun k -> (k * 0x35) land 0xff) in
+  let i2c =
+    [ 0x619 (* Q = 25 *); 0x100; 0x2A0; 0x210; 0x25A; 0x2C3; 0x500
+    ; 0x100; 0x2A0; 0x210; 0x100; 0x2A1; 0x300; 0x400; 0x500 ]
+  in
+  let uart = List.init 12 ~f:(fun k -> (k * 0x4b) lxor 0xa5 land 0xff) in
+  let pending =
+    [| Queue.of_list
+         (0x8003
+          :: List.mapi spi_data ~f:(fun i b ->
+            b lor (if i = 0 then 0x100 else 0) lor if i = 11 then 0x200 else 0))
+     ; Queue.of_list i2c
+     ; Queue.of_list uart
+    |]
+  in
+  let want = [| List.length spi_data; 9; List.length uart |] in
+  let got = Array.create ~len:3 [] in
+  let deadline = t.cycle + 300_000 in
+  while
+    Array.existsi want ~f:(fun e n -> List.length got.(e) < n) && t.cycle < deadline
+  do
+    for e = 0 to 2 do
+      let st = H.read1 t (H.status e) in
+      let inbox = (st lsr 10) land 3
+      and outbox = (st lsr 12) land 3 in
+      if outbox > 0 then got.(e) <- got.(e) @ H.read t (H.mailbox e) outbox;
+      let room = 2 - inbox in
+      let words = List.init (min room (Queue.length pending.(e))) ~f:(fun _ -> ()) in
+      let words = List.map words ~f:(fun () -> Queue.dequeue_exn pending.(e)) in
+      if not (List.is_empty words) then H.write t (H.mailbox e) words
+    done
+  done;
+  let khz = I2c_timing.check timing ~fast:true ~ns_per_cycle:20 in
+  let all_three = Hashtbl.count windows ~f:(fun v -> v = 7)
+  and any = Hashtbl.length windows in
+  let spi_expected =
+    0xA5 :: List.map (List.drop_last_exn spi_data) ~f:(fun b -> lnot b land 0xff)
+  in
+  if not ([%equal: int list] (List.rev spi.received) spi_data) then failwith "SPI target data";
+  if not ([%equal: int list] got.(0) spi_expected) then failwith "SPI master data";
+  if not ([%equal: int list] got.(1) [ 0; 0; 0; 0; 0; 0; 0; 0x5A; 0xC3 ]) then failwith "I2C";
+  if not ([%equal: int list] got.(2) uart) then failwith "UART";
+  printf "SPI  %d bytes each way in one CS-low transfer: ok\n" (List.length spi_data);
+  printf "I2C  replies %s, EEPROM 0x10-11 = %02x %02x, %d kHz, %d stretched ACKs\n" (hex got.(1))
+    eeprom.mem.(0x10) eeprom.mem.(0x11) khz eeprom.stretches;
+  printf "UART %d bytes echoed: ok\n" (List.length uart);
+  printf "all three mid-transfer in %d of %d busy 1000-cycle windows\n" all_three any;
+  [%expect {|
+    SPI  12 bytes each way in one CS-low transfer: ok
+    I2C  replies 0000 0000 0000 0000 0000 0000 0000 005a 00c3, EEPROM 0x10-11 = 5a c3, 384 kHz, 7 stretched ACKs
+    UART 12 bytes echoed: ok
+    all three mid-transfer in 6 of 28 busy 1000-cycle windows
+    |}]
+;;
