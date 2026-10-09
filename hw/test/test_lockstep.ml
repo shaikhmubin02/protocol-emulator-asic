@@ -107,7 +107,7 @@ let%expect_test "spi_master.s in lockstep against an SPI target, all four modes"
 
 let%expect_test "i2c_master.s in lockstep with a stretching target" =
   let ls = Lockstep.create (load "i2c_master.s") in
-  let pending = Queue.of_list [ 0x100; 0x2A0; 0x210; 0x25A; 0x500; 0x100; 0x2A1; 0x300; 0x400; 0x500 ] in
+  let pending = Queue.of_list [ 0x608; 0x100; 0x2A0; 0x210; 0x25A; 0x500; 0x100; 0x2A1; 0x300; 0x400; 0x500 ] in
   let stretch = ref 0
   and prev_scl = ref 1
   and acked_bits = ref 0 in

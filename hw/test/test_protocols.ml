@@ -277,24 +277,126 @@ module Eeprom = struct
   ;;
 end
 
-let%expect_test "i2c_master.s against an EEPROM that stretches the clock" =
+(* Watches SCL and SDA and keeps the shortest time seen for each of the I2C spec's timing
+   parameters, in clock cycles. *)
+module I2c_timing = struct
+  type t =
+    { mutable now : int
+    ; mutable scl : int
+    ; mutable sda : int
+    ; mutable rise : int option (* last SCL rise *)
+    ; mutable fall : int option (* last SCL fall *)
+    ; mutable sda_change : int
+    ; mutable start : int option (* START waiting for its SCL fall *)
+    ; mutable stop : int option
+    ; mutable fastest : int option (* rise to rise *)
+    ; mins : (string, int) Hashtbl.t
+    ; mutable longest_low : int
+    }
+
+  let create () =
+    { now = 0
+    ; scl = 1
+    ; sda = 1
+    ; rise = None
+    ; fall = None
+    ; sda_change = 0
+    ; start = None
+    ; stop = None
+    ; fastest = None
+    ; mins = Hashtbl.create (module String)
+    ; longest_low = 0
+    }
+  ;;
+
+  let note t name v =
+    Hashtbl.update t.mins name ~f:(function
+      | None -> v
+      | Some m -> min m v)
+  ;;
+
+  let step t ~scl ~sda =
+    let since = Option.map ~f:(fun x -> t.now - x) in
+    if scl = 1 && t.scl = 0
+    then (
+      Option.iter (since t.fall) ~f:(fun d ->
+        note t "tLOW" d;
+        t.longest_low <- max t.longest_low d);
+      Option.iter (since t.rise) ~f:(fun d ->
+        t.fastest <- Some (Option.value_map t.fastest ~default:d ~f:(min d)));
+      note t "tSU;DAT" (t.now - t.sda_change);
+      t.rise <- Some t.now);
+    if scl = 0 && t.scl = 1
+    then (
+      Option.iter (since t.rise) ~f:(note t "tHIGH");
+      Option.iter (since t.start) ~f:(note t "tHD;STA");
+      t.start <- None;
+      t.fall <- Some t.now);
+    if sda <> t.sda
+    then (
+      if scl = 1 && t.scl = 1 && sda = 0
+      then (
+        (* START: setup from the SCL rise (repeated START) and bus free since the last STOP *)
+        Option.iter (since t.rise) ~f:(note t "tSU;STA");
+        Option.iter (since t.stop) ~f:(note t "tBUF");
+        t.start <- Some t.now);
+      if scl = 1 && t.scl = 1 && sda = 1
+      then (
+        Option.iter (since t.rise) ~f:(note t "tSU;STO");
+        t.stop <- Some t.now);
+      t.sda_change <- t.now);
+    t.scl <- scl;
+    t.sda <- sda;
+    t.now <- t.now + 1
+  ;;
+
+  (* minimums from the I2C spec (UM10204, table 10), in ns *)
+  let spec ~fast =
+    if fast
+    then
+      [ "tLOW", 1300; "tHIGH", 600; "tSU;STA", 600; "tHD;STA", 600; "tSU;STO", 600
+      ; "tBUF", 1300; "tSU;DAT", 100 ]
+    else
+      [ "tLOW", 4700; "tHIGH", 4000; "tSU;STA", 4700; "tHD;STA", 4000; "tSU;STO", 4000
+      ; "tBUF", 4700; "tSU;DAT", 250 ]
+  ;;
+
+  (* check against the spec at [ns_per_cycle]; returns the SCL rate in kHz *)
+  let check t ~fast ~ns_per_cycle =
+    List.iter (spec ~fast) ~f:(fun (name, min_ns) ->
+      match Hashtbl.find t.mins name with
+      | None -> raise_s [%message "never measured" name]
+      | Some cycles ->
+        if cycles * ns_per_cycle < min_ns
+        then raise_s [%message "too short" name (cycles : int) (min_ns : int)]);
+    let period = Option.value_exn t.fastest in
+    let khz = 1_000_000 / (period * ns_per_cycle) in
+    let limit = if fast then 400 else 100 in
+    if khz > limit then raise_s [%message "SCL too fast" (khz : int)];
+    khz
+  ;;
+end
+
+let i2c_eeprom_run ?speed ~stretch () =
   let prog = load "i2c_master.s" in
   let m = Model.create prog in
-  let dev = Eeprom.create ~stretch:23 in
+  let dev = Eeprom.create ~stretch in
+  let timing = I2c_timing.create () in
   let start = 0x100
   and write b = 0x200 lor b
   and read_ack = 0x300
   and read_nack = 0x400
   and stop = 0x500 in
   let commands =
-    [ start; write 0xA0; write 0x10; write 0x5A; write 0xC3; stop
-    ; start; write 0xA0; write 0x10; start; write 0xA1; read_ack; read_nack; stop
-    ; start; write 0x84; stop
-    ]
+    Option.to_list (Option.map speed ~f:(fun q -> 0x600 lor q))
+    @ [ start; write 0xA0; write 0x10; write 0x5A; write 0xC3; stop
+      ; start; write 0xA0; write 0x10; start; write 0xA1; read_ack; read_nack; stop
+      ; start; write 0x84; stop
+      ]
   in
   let host = Host.create commands in
   let master_drove_high = ref false in
-  for _ = 1 to 20000 do
+  for _ = 1 to 200_000 do
     let master_low p = bit (Model.uio_oe m) p = 1 && bit (Model.uio_out m) p = 0 in
     if (bit (Model.uio_oe m) 0 = 1 && bit (Model.uio_out m) 0 = 1)
        || (bit (Model.uio_oe m) 1 = 1 && bit (Model.uio_out m) 1 = 1)
@@ -302,6 +404,7 @@ let%expect_test "i2c_master.s against an EEPROM that stretches the clock" =
     let scl = if master_low 0 || Eeprom.scl_low dev then 0 else 1 in
     let sda = if master_low 1 || dev.sda_low then 0 else 1 in
     Eeprom.step dev ~scl ~sda;
+    I2c_timing.step timing ~scl ~sda;
     Model.step m { Model.Pads.zero with uio_in = scl lor (sda lsl 1) };
     Host.service host m
   done;
@@ -312,7 +415,32 @@ let%expect_test "i2c_master.s against an EEPROM that stretches the clock" =
   if dev.mem.(0x10) <> 0x5A || dev.mem.(0x11) <> 0xC3 then failwith "EEPROM contents wrong";
   if !master_drove_high then failwith "master drove a line high (not open drain)";
   if dev.stretches = 0 then failwith "no clock stretching happened";
+  prog, replies, dev, timing
+;;
+
+let%expect_test "i2c_master.s against an EEPROM that stretches the clock" =
+  let prog, replies, dev, _ = i2c_eeprom_run ~stretch:23 () in
   printf "%d words; replies %s; %d STARTs, %d stretched ACKs\n" (Array.length prog)
     (Sexp.to_string [%sexp (replies : int list)]) dev.starts dev.stretches;
-  [%expect {| 77 words; replies (0 0 0 0 0 0 0 90 195 1); 4 STARTs, 7 stretched ACKs |}]
+  [%expect {| 120 words; replies (0 0 0 0 0 0 0 90 195 1); 4 STARTs, 7 stretched ACKs |}]
+;;
+
+(* At a 50 MHz clock (20 ns a cycle), with the target holding SCL low for longer than the master
+   would, so the master really has to wait. *)
+let%expect_test "i2c_master.s meets the spec timing at 100 and 400 kHz" =
+  List.iter [ "standard", 100, false; "fast", 25, true ] ~f:(fun (name, q, fast) ->
+    let _, _, dev, timing = i2c_eeprom_run ~speed:q ~stretch:(4 * q) () in
+    let khz = I2c_timing.check timing ~fast ~ns_per_cycle:20 in
+    let mins =
+      List.map (I2c_timing.spec ~fast) ~f:(fun (n, _) ->
+        sprintf "%s %d" n (Hashtbl.find_exn timing.mins n * 20))
+    in
+    printf "%s (Q = %d): SCL %d kHz, %d stretched ACKs, longest SCL low %d ns\n  shortest (ns): %s\n"
+      name q khz dev.stretches (timing.longest_low * 20) (String.concat ~sep:", " mins));
+  [%expect {|
+    standard (Q = 100): SCL 98 kHz, 7 stretched ACKs, longest SCL low 8020 ns
+      shortest (ns): tLOW 5980, tHIGH 4120, tSU;STA 6100, tHD;STA 6000, tSU;STO 4120, tBUF 14140, tSU;DAT 3980
+    fast (Q = 25): SCL 381 kHz, 7 stretched ACKs, longest SCL low 2020 ns
+      shortest (ns): tLOW 1480, tHIGH 1120, tSU;STA 1600, tHD;STA 1500, tSU;STO 1120, tBUF 3640, tSU;DAT 980
+    |}]
 ;;
