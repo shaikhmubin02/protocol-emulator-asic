@@ -205,3 +205,32 @@ let%expect_test "ws2812.s in lockstep" =
   [%expect {| 15000 cycles in lockstep, 0 words left |}]
 ;;
 
+(* 1-Wire with time scaled down 10x (5 cycles a microsecond) to keep the RTL simulation short *)
+let%expect_test "onewire.s in lockstep against a 1-Wire device" =
+  let ls = Lockstep.create (load "onewire.s") in
+  let dev =
+    Devices.One_wire_device.create ~us:5 ~family:0x28 ~serial:[ 1; 2; 3; 4; 5; 6 ]
+  in
+  let pending =
+    Queue.of_list ([ 0x405; 0x100; 0x233 ] @ List.init 8 ~f:(fun _ -> 0x300))
+  in
+  let line = ref 1
+  and got = ref [] in
+  for _ = 1 to 60_000 do
+    let send = Queue.peek pending in
+    let read, wrote =
+      Lockstep.step ?send ~receive:true ls { Model.Pads.zero with uio_in = !line lsl 2 }
+    in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got);
+    let master_low = bit (Lockstep.uio_oe ls) 2 = 1 && bit (Lockstep.uio_out ls) 2 = 0 in
+    line := Devices.One_wire_device.step dev ~master_low
+  done;
+  let got = List.rev !got in
+  if not (List.is_empty dev.errors) then raise_s [%message (dev.errors : string list)];
+  printf "%d cycles in lockstep, replies %s, ROM matches %b\n" ls.cycle
+    (Sexp.to_string [%sexp (got : int list)])
+    ([%equal: int list] (List.drop got 1) (Array.to_list dev.rom));
+  [%expect {| 60000 cycles in lockstep, replies (0 40 1 2 3 4 5 6 158), ROM matches true |}]
+;;
+

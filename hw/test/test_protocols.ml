@@ -192,3 +192,55 @@ let%expect_test "ws2812.s drives an LED chain (a protocol the chip wasn't design
   [%expect {| 29 words; 2 frames latched, every pulse within the datasheet's +-150 ns |}]
 ;;
 
+(* ---------------- 1-Wire ---------------- *)
+
+let onewire_run ?device ~cycles commands =
+  let prog = load "onewire.s" in
+  let m = Model.create prog in
+  let host = Host.create commands in
+  let line = ref 1
+  and drove_high = ref false in
+  for _ = 1 to cycles do
+    Model.step m { Model.Pads.zero with uio_in = !line lsl 2 };
+    let oe = bit (Model.uio_oe m) 2 = 1 in
+    if oe && bit (Model.uio_out m) 2 = 1 then drove_high := true;
+    let master_low = oe && bit (Model.uio_out m) 2 = 0 in
+    line
+    := (match device with
+        | Some d -> One_wire_device.step d ~master_low
+        | None -> if master_low then 0 else 1);
+    Host.service host m
+  done;
+  if !drove_high then failwith "master drove the line high (not open drain)";
+  prog, Host.received host
+;;
+
+let%expect_test "onewire.s reads a device's ROM ID (another protocol it wasn't designed for)" =
+  printf "CRC-8 of the example in Maxim's app note 27: %02X\n"
+    (crc8 [ 0x02; 0x1C; 0xB8; 0x01; 0x00; 0x00; 0x00 ]);
+  let dev =
+    One_wire_device.create ~us:50 ~family:0x28 ~serial:[ 0xA1; 0xB2; 0xC3; 0xD4; 0xE5; 0xF6 ]
+  in
+  (* RESET, READ ROM, read 8 bytes; then RESET, SKIP ROM, CONVERT T (as for a DS18B20) *)
+  let commands =
+    [ 0x100; 0x233 ] @ List.init 8 ~f:(fun _ -> 0x300) @ [ 0x100; 0x2CC; 0x244 ]
+  in
+  let prog, replies = onewire_run ~device:dev ~cycles:500_000 commands in
+  if not (List.is_empty dev.errors) then raise_s [%message (dev.errors : string list)];
+  let rom = List.sub replies ~pos:1 ~len:8 in
+  if not ([%equal: int list] rom (Array.to_list dev.rom)) then raise_s [%message (rom : int list)];
+  if crc8 (List.take rom 7) <> List.nth_exn rom 7 then failwith "CRC";
+  printf "%d words; presence %d, ROM %s (CRC ok), presence %d; device got %s\n"
+    (Array.length prog) (List.hd_exn replies)
+    (String.concat ~sep:" " (List.map rom ~f:(sprintf "%02X")))
+    (List.nth_exn replies 9)
+    (String.concat ~sep:" " (List.rev_map dev.written ~f:(sprintf "%02X")));
+  let _, replies = onewire_run ~cycles:60_000 [ 0x100 ] in
+  printf "with nothing on the bus, RESET says %s\n" (Sexp.to_string [%sexp (replies : int list)]);
+  [%expect {|
+    CRC-8 of the example in Maxim's app note 27: A2
+    74 words; presence 0, ROM 28 A1 B2 C3 D4 E5 F6 AC (CRC ok), presence 0; device got 33 CC 44
+    with nothing on the bus, RESET says (1)
+    |}]
+;;
+

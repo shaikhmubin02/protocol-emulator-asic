@@ -376,3 +376,138 @@ module Ws2812 = struct
     t.now <- t.now + 1
   ;;
 end
+
+(* Dallas/Maxim CRC-8 (x^8 + x^5 + x^4 + 1, LSB first), the one 1-Wire ROM IDs end with *)
+let crc8 bytes =
+  List.fold bytes ~init:0 ~f:(fun crc b ->
+    let crc = ref crc
+    and b = ref b in
+    for _ = 1 to 8 do
+      let mix = (!crc lxor !b) land 1 in
+      crc := !crc lsr 1;
+      if mix = 1 then crc := !crc lxor 0x8C;
+      b := !b lsr 1
+    done;
+    !crc)
+;;
+
+(* A 1-Wire device with a 64-bit ROM ID (family, 6-byte serial, CRC-8), from the 1-Wire spec as
+   used by the DS18B20 datasheet, standard speed. After a reset pulse it answers with a presence
+   pulse; it reads each bit by looking at the line 30 us after the master pulls it low; on READ
+   ROM (0x33) it sends its ID, holding the line low for 15 us for each 0 bit. Other bytes it just
+   records.
+
+   It's stepped with what the master is doing ([master_low]) and returns the line level. It checks
+   the master's side of every slot: reset low at least 480 us, a written 0 low 60-120 us, a 1 or
+   a read slot low 1-15 us, at least 60 us per slot plus 1 us recovery. *)
+module One_wire_device = struct
+  type mode =
+    | Idle
+    | Command
+    | Send_rom of int (* next bit *)
+
+  type t =
+    { us : int (* cycles per microsecond *)
+    ; rom : int array
+    ; mutable now : int
+    ; mutable master_was_low : bool
+    ; mutable fell : int option (* when the master last pulled low *)
+    ; mutable released : int (* when the master last let go *)
+    ; mutable low_from : int
+    ; mutable low_until : int (* when the device itself holds the line low *)
+    ; mutable mode : mode
+    ; mutable shift : int
+    ; mutable nbits : int
+    ; mutable sample_at : int option
+    ; mutable written : int list (* newest first *)
+    ; mutable resets : int
+    ; mutable errors : string list
+    }
+
+  let create ~us ~family ~serial =
+    let id = (family :: serial) in
+    { us
+    ; rom = Array.of_list (id @ [ crc8 id ])
+    ; now = 0
+    ; master_was_low = false
+    ; fell = None
+    ; released = -1_000_000
+    ; low_from = 0
+    ; low_until = 0
+    ; mode = Idle
+    ; shift = 0
+    ; nbits = 0
+    ; sample_at = None
+    ; written = []
+    ; resets = 0
+    ; errors = []
+    }
+  ;;
+
+  let error t s = t.errors <- sprintf "%d us: %s" (t.now / t.us) s :: t.errors
+  let device_low t = t.now >= t.low_from && t.now < t.low_until
+
+  let take_bit t b =
+    t.shift <- t.shift lor (b lsl t.nbits);
+    t.nbits <- t.nbits + 1;
+    if t.nbits = 8
+    then (
+      t.written <- t.shift :: t.written;
+      if t.shift = 0x33 then t.mode <- Send_rom 0;
+      t.shift <- 0;
+      t.nbits <- 0)
+  ;;
+
+  let step t ~master_low =
+    let us_since x = (t.now - x) / t.us in
+    if master_low && not t.master_was_low
+    then (
+      (* start of a slot (or of a reset) *)
+      Option.iter t.fell ~f:(fun f ->
+        if us_since f < 61 && t.resets > 0 && not (Poly.equal t.mode Idle)
+        then error t (sprintf "slot only %d us" (us_since f)));
+      if us_since t.released < 1 then error t "no recovery time";
+      t.fell <- Some t.now;
+      match t.mode with
+      | Idle -> ()
+      | Command -> t.sample_at <- Some (t.now + (30 * t.us))
+      | Send_rom k ->
+        let b = (t.rom.(k / 8) lsr (k mod 8)) land 1 in
+        (* a 0 is held for 15 us, the shortest the spec allows: the master has to sample
+           within 15 us of its falling edge *)
+        if b = 0
+        then (
+          t.low_from <- t.now;
+          t.low_until <- t.now + (15 * t.us));
+        t.mode <- (if k = 63 then Idle else Send_rom (k + 1)));
+    if (not master_low) && t.master_was_low
+    then (
+      t.released <- t.now;
+      match t.fell with
+      | None -> ()
+      | Some f ->
+        let low_us = us_since f in
+        if low_us >= 480
+        then (
+          (* reset: answer with a presence pulse, 30 us after the release, for 120 us *)
+          t.resets <- t.resets + 1;
+          t.low_from <- t.now + (30 * t.us);
+          t.low_until <- t.now + (150 * t.us);
+          t.mode <- Command;
+          t.shift <- 0;
+          t.nbits <- 0;
+          t.sample_at <- None;
+          t.fell <- None)
+        else if not ((low_us >= 1 && low_us < 15) || (low_us >= 60 && low_us <= 120))
+        then error t (sprintf "master held the line low for %d us" low_us));
+    let line = if master_low || device_low t then 0 else 1 in
+    (match t.sample_at with
+     | Some at when t.now = at ->
+       take_bit t line;
+       t.sample_at <- None
+     | _ -> ());
+    t.master_was_low <- master_low;
+    t.now <- t.now + 1;
+    line
+  ;;
+end
