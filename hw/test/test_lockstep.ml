@@ -74,28 +74,35 @@ let load name =
   | Error e -> failwith e
 ;;
 
-let%expect_test "spi_master.s in lockstep against an SPI target" =
-  let ls = Lockstep.create (load "spi_master.s") in
-  let pending = Queue.of_list [ 0x1A5; 0x03C; 0x2F0 ] in
-  let miso = ref 0
-  and prev_sck = ref 0
-  and shift = ref 0x5A in
-  let got = ref [] in
-  for _ = 1 to 3000 do
-    let send = Queue.peek pending in
-    let read, wrote =
-      Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = !miso lsl 4 }
-    in
-    if wrote then ignore (Queue.dequeue_exn pending : int);
-    Option.iter read ~f:(fun v -> got := v :: !got);
-    (* tiny target: shifts out 0x5A repeatedly on falling edges *)
-    let sck = bit (Lockstep.uo ls) 1 in
-    if sck = 0 && !prev_sck = 1 then shift := ((!shift lsl 1) lor (!shift lsr 7)) land 0xff;
-    miso := bit !shift 7;
-    prev_sck := sck
+let%expect_test "spi_master.s in lockstep against an SPI target, all four modes" =
+  for mode = 0 to 3 do
+    let ls = Lockstep.create (load "spi_master.s") in
+    let pending = Queue.of_list [ 0x8000 lor mode; 0x1A5; 0x03C; 0x2F0 ] in
+    let miso = ref 0
+    and prev_sck = ref 0
+    and shift = ref 0x5A in
+    let got = ref [] in
+    for _ = 1 to 3000 do
+      let send = Queue.peek pending in
+      let read, wrote =
+        Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = !miso lsl 4 }
+      in
+      if wrote then ignore (Queue.dequeue_exn pending : int);
+      Option.iter read ~f:(fun v -> got := v :: !got);
+      (* tiny target: shifts out 0x5A repeatedly on falling edges *)
+      let sck = bit (Lockstep.uo ls) 1 in
+      if sck = 0 && !prev_sck = 1 then shift := ((!shift lsl 1) lor (!shift lsr 7)) land 0xff;
+      miso := bit !shift 7;
+      prev_sck := sck
+    done;
+    printf "mode %d: %d cycles in lockstep, %d replies\n" mode ls.cycle (List.length !got)
   done;
-  printf "%d cycles in lockstep, %d replies\n" ls.cycle (List.length !got);
-  [%expect {| 3000 cycles in lockstep, 3 replies |}]
+  [%expect {|
+    mode 0: 3000 cycles in lockstep, 3 replies
+    mode 1: 3000 cycles in lockstep, 3 replies
+    mode 2: 3000 cycles in lockstep, 3 replies
+    mode 3: 3000 cycles in lockstep, 3 replies
+    |}]
 ;;
 
 let%expect_test "i2c_master.s in lockstep with a stretching target" =

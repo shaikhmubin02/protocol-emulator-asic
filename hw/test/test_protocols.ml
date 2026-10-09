@@ -35,11 +35,16 @@ let%expect_test "uart.s: full-duplex loopback, back-to-back frames" =
 
 (* ---------------- SPI ---------------- *)
 
-(* SPI mode 0 target: samples MOSI on the rising edge, changes MISO after the falling edge.
-   It answers each byte with the previous byte it received, inverted (0xA5 for the first). *)
+(* SPI target for any mode. CPOL is the level SCK idles at; the leading edge is the one away
+   from it. CPHA 0: MISO is valid before the leading edge, both sides sample on it, MISO changes
+   on the trailing edge. CPHA 1: MISO changes on the leading edge, both sides sample on the
+   trailing edge. It answers each byte with the previous byte it received, inverted (0xA5 for
+   the first). It also checks the bus: SCK must be idle whenever CS changes. *)
 module Spi_target = struct
   type t =
-    { mutable sck : int
+    { cpol : int
+    ; cpha : bool
+    ; mutable sck : int
     ; mutable cs : int
     ; mutable rx : int
     ; mutable tx : int
@@ -47,50 +52,71 @@ module Spi_target = struct
     ; mutable miso : int
     ; mutable last : int
     ; mutable received : int list
+    ; mutable edges : int
     }
 
-  let create () =
-    { sck = 0; cs = 1; rx = 0; tx = 0xA5; count = 0; miso = 0; last = 0xA5; received = [] }
+  let create ~mode =
+    let cpol = (mode lsr 1) land 1 in
+    { cpol
+    ; cpha = mode land 1 = 1
+    ; sck = cpol
+    ; cs = 1
+    ; rx = 0
+    ; tx = 0xA5
+    ; count = 0
+    ; miso = 0
+    ; last = 0xA5
+    ; received = []
+    ; edges = 0
+    }
+  ;;
+
+  let sample t mosi =
+    t.rx <- ((t.rx lsl 1) lor mosi) land 0xff;
+    t.count <- t.count + 1;
+    if t.count = 8
+    then (
+      t.received <- t.rx :: t.received;
+      t.last <- lnot t.rx land 0xff)
+  ;;
+
+  (* next bit out; after a full byte, start on the reply to it *)
+  let shift_out t =
+    if t.count = 8
+    then (
+      t.count <- 0;
+      t.tx <- t.last);
+    t.miso <- bit t.tx (7 - t.count)
   ;;
 
   let step t ~sck ~mosi ~cs =
+    if cs <> t.cs && sck <> t.cpol then raise_s [%message "CS changed with SCK not idle" (sck : int)];
     if cs = 0 && t.cs = 1
     then (
       t.count <- 0;
       t.tx <- t.last;
-      t.miso <- bit t.tx 7);
-    if cs = 0
+      if not t.cpha then t.miso <- bit t.tx 7);
+    if cs = 0 && sck <> t.sck
     then (
-      if sck = 1 && t.sck = 0
-      then (
-        t.rx <- ((t.rx lsl 1) lor mosi) land 0xff;
-        t.count <- t.count + 1;
-        if t.count = 8
-        then (
-          t.received <- t.rx :: t.received;
-          t.last <- lnot t.rx land 0xff));
-      if sck = 0 && t.sck = 1
-      then
-        if t.count = 8
-        then (
-          t.count <- 0;
-          t.tx <- t.last;
-          t.miso <- bit t.tx 7)
-        else t.miso <- bit t.tx (7 - t.count));
+      t.edges <- t.edges + 1;
+      let leading = sck <> t.cpol in
+      match t.cpha, leading with
+      | false, true | true, false -> sample t mosi
+      | false, false | true, true -> shift_out t);
     t.sck <- sck;
     t.cs <- cs
   ;;
 end
 
-let%expect_test "spi_master.s against an SPI mode 0 target" =
+let spi_run ~mode data =
   let prog = load "spi_master.s" in
   let m = Model.create prog in
-  let dev = Spi_target.create () in
-  let data = [ 0x12; 0x34; 0xF0; 0x0F ] in
-  (* one transaction: CS low before the first byte, high after the last *)
+  let dev = Spi_target.create ~mode in
+  (* pick the mode, then one transaction: CS low before the first byte, high after the last *)
   let host =
     Host.create
-      (List.mapi data ~f:(fun i b ->
+      ((0x8000 lor mode)
+       :: List.mapi data ~f:(fun i b ->
          let first = if i = 0 then 0x100 else 0 in
          let last = if i = List.length data - 1 then 0x200 else 0 in
          b lor first lor last))
@@ -107,14 +133,27 @@ let%expect_test "spi_master.s against an SPI mode 0 target" =
   let replies = Host.received host in
   let received = List.rev dev.received in
   let expected_replies = 0xA5 :: List.map (List.drop_last_exn data) ~f:(fun b -> lnot b land 0xff) in
-  if not ([%equal: int list] received data) then raise_s [%message (received : int list)];
+  if not ([%equal: int list] received data) then raise_s [%message (mode : int) (received : int list)];
   if not ([%equal: int list] replies expected_replies)
-  then raise_s [%message (replies : int list) (expected_replies : int list)];
+  then raise_s [%message (mode : int) (replies : int list) (expected_replies : int list)];
   if !cs_rises <> 1 then raise_s [%message "CS should rise once" (!cs_rises : int)];
-  printf "%d words; target got %s, master got %s\n" (Array.length prog)
+  if dev.edges <> 16 * List.length data then raise_s [%message "SCK edges" (dev.edges : int)];
+  if bit (Model.uo_out m) 1 <> dev.cpol then raise_s [%message "SCK not idle at the end"];
+  printf "mode %d: %d words; target got %s, master got %s\n" mode (Array.length prog)
     (Sexp.to_string [%sexp (received : int list)])
-    (Sexp.to_string [%sexp (replies : int list)]);
-  [%expect {| 22 words; target got (18 52 240 15), master got (165 237 203 15) |}]
+    (Sexp.to_string [%sexp (replies : int list)])
+;;
+
+let%expect_test "spi_master.s against an SPI target, all four modes" =
+  for mode = 0 to 3 do
+    spi_run ~mode [ 0x12; 0x34; 0xF0; 0x0F ]
+  done;
+  [%expect {|
+    mode 0: 41 words; target got (18 52 240 15), master got (165 237 203 15)
+    mode 1: 41 words; target got (18 52 240 15), master got (165 237 203 15)
+    mode 2: 41 words; target got (18 52 240 15), master got (165 237 203 15)
+    mode 3: 41 words; target got (18 52 240 15), master got (165 237 203 15)
+    |}]
 ;;
 
 (* ---------------- I2C ---------------- *)
