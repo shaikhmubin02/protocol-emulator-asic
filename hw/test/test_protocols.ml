@@ -153,3 +153,42 @@ let%expect_test "i2c_master.s meets the spec timing at 100 and 400 kHz" =
       shortest (ns): tLOW 1480, tHIGH 1120, tSU;STA 1600, tHD;STA 1500, tSU;STO 1120, tBUF 3640, tSU;DAT 980
     |}]
 ;;
+
+(* ---------------- WS2812 ---------------- *)
+
+(* colours as 24-bit GRB values, packed MSB first into 16-bit host words *)
+let ws2812_words colours =
+  let bits =
+    List.concat_map colours ~f:(fun c -> List.init 24 ~f:(fun k -> bit c (23 - k)))
+  in
+  List.chunks_of bits ~length:16
+  |> List.map ~f:(fun chunk -> List.fold chunk ~init:0 ~f:(fun acc b -> (acc lsl 1) lor b))
+;;
+
+let ws2812_frames =
+  [ [ 0xFF0000; 0x00FF00; 0x0000FF; 0x123456; 0xABCDEF; 0x000001; 0x800000; 0xFFFFFF ]
+  ; [ 0x000000; 0x555555; 0xAAAAAA; 0x0F0F0F; 0xF0F0F0; 0x010203; 0x7F7F7F; 0x808080 ]
+  ]
+;;
+
+let%expect_test "ws2812.s drives an LED chain (a protocol the chip wasn't designed for)" =
+  let prog = load "ws2812.s" in
+  let m = Model.create prog in
+  let leds = Ws2812.create ~n:8 ~ns_per_cycle:20 in
+  (* two frames, with the line left idle in between *)
+  List.iter ws2812_frames ~f:(fun frame ->
+    let host = Host.create (ws2812_words frame) in
+    for _ = 1 to 20_000 do
+      Model.step m Model.Pads.zero;
+      Ws2812.step leds (bit (Model.uo_out m) 0);
+      Host.service host m
+    done);
+  if not (List.is_empty leds.errors) then raise_s [%message (leds.errors : string list)];
+  let got = List.rev_map leds.frames ~f:Array.to_list in
+  if not ([%equal: int list list] got ws2812_frames)
+  then raise_s [%message (got : int list list)];
+  printf "%d words; %d frames latched, every pulse within the datasheet's +-150 ns\n"
+    (Array.length prog) (List.length got);
+  [%expect {| 29 words; 2 frames latched, every pulse within the datasheet's +-150 ns |}]
+;;
+

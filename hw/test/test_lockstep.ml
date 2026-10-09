@@ -192,3 +192,16 @@ let%expect_test "random programs on a lite engine (no fabric, no CRC)" =
   printf "%d random programs x 2000 cycles on a lite engine: no difference\n" programs;
   [%expect {| 150 random programs x 2000 cycles on a lite engine: no difference |}]
 ;;
+
+let%expect_test "ws2812.s in lockstep" =
+  let ls = Lockstep.create (load "ws2812.s") in
+  let pending = Queue.of_list (List.init 12 ~f:(fun k -> (k * 0x9e37) land 0xffff)) in
+  for _ = 1 to 15_000 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int)
+  done;
+  printf "%d cycles in lockstep, %d words left\n" ls.cycle (Queue.length pending);
+  [%expect {| 15000 cycles in lockstep, 0 words left |}]
+;;
+

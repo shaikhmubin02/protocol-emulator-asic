@@ -297,3 +297,82 @@ module I2c_timing = struct
     khz
   ;;
 end
+
+(* A chain of WS2812B LEDs on one wire, from the datasheet: each bit is a high pulse, 0.40 us
+   for a 0 and 0.80 us for a 1, followed by a low of 0.85 us or 0.45 us, all +-150 ns. The
+   first LED keeps the first 24 bits (green, red, blue, MSB first) and passes the rest on down
+   the chain. A low of 50 us or more latches. Every pulse is checked against the datasheet. *)
+module Ws2812 = struct
+  type t =
+    { n : int
+    ; ns_per_cycle : int
+    ; mutable level : int
+    ; mutable since : int
+    ; mutable now : int
+    ; mutable bits : int list (* this frame, newest first *)
+    ; mutable last_bit : int option
+    ; mutable frames : int array list (* latched colours, newest first *)
+    ; mutable errors : string list
+    }
+
+  let create ~n ~ns_per_cycle =
+    { n
+    ; ns_per_cycle
+    ; level = 0
+    ; since = 0
+    ; now = 0
+    ; bits = []
+    ; last_bit = None
+    ; frames = []
+    ; errors = []
+    }
+  ;;
+
+  let reset_ns = 50_000
+  let error t s = t.errors <- sprintf "cycle %d: %s" t.now s :: t.errors
+  let near t cycles ~ns = abs ((cycles * t.ns_per_cycle) - ns) <= 150
+
+  let latch t =
+    let bits = Array.of_list (List.rev t.bits) in
+    if Array.length bits < 24 * t.n
+    then error t (sprintf "latched after %d bits" (Array.length bits))
+    else
+      t.frames
+      <- Array.init t.n ~f:(fun led ->
+           Array.foldi (Array.sub bits ~pos:(24 * led) ~len:24) ~init:0 ~f:(fun _ acc b ->
+             (acc lsl 1) lor b))
+         :: t.frames;
+    t.bits <- [];
+    t.last_bit <- None
+  ;;
+
+  let step t level =
+    if level <> t.level
+    then (
+      let width = t.now - t.since in
+      if t.level = 1
+      then (
+        let b =
+          if near t width ~ns:400 then 0 else if near t width ~ns:800 then 1 else -1
+        in
+        if b < 0
+        then error t (sprintf "high for %d ns" (width * t.ns_per_cycle))
+        else (
+          t.bits <- b :: t.bits;
+          t.last_bit <- Some b))
+      else (
+        match t.last_bit with
+        | None -> ()
+        | Some b ->
+          let ns = if b = 0 then 850 else 450 in
+          if not (near t width ~ns)
+          then error t (sprintf "low for %d ns after a %d" (width * t.ns_per_cycle) b));
+      t.level <- level;
+      t.since <- t.now);
+    if t.level = 0
+       && (t.now - t.since) * t.ns_per_cycle >= reset_ns
+       && not (List.is_empty t.bits)
+    then latch t;
+    t.now <- t.now + 1
+  ;;
+end
