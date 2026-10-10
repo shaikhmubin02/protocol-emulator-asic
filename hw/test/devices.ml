@@ -511,3 +511,107 @@ module One_wire_device = struct
     line
   ;;
 end
+
+(* A UART at the far end of the wire, 8N1, on its own exact clock: it decodes the line by
+   sampling the middle of each bit by its own timing (start bit low, stop bit high or it's a
+   framing error), sends bytes back to back at its own rate, and measures how far each edge it
+   receives lands from where an ideal transmitter would put it. Times in ns. *)
+module Uart_line = struct
+  type t =
+    { bit_ns : float
+    ; ns_per_cycle : float
+    ; mutable now : float
+    ; (* receiving *)
+      mutable prev : int
+    ; mutable frame_start : float option
+    ; mutable sampled : int (* bits sampled in this frame *)
+    ; mutable shift : int
+    ; mutable received : int list (* newest first *)
+    ; mutable errors : string list
+    ; mutable worst_edge : float (* as a fraction of a bit *)
+    ; (* sending *)
+      to_send : int Queue.t
+    ; mutable tx_start : float
+    ; mutable tx_byte : int option
+    }
+
+  let create ~baud ~ns_per_cycle words =
+    { bit_ns = 1e9 /. Float.of_int baud
+    ; ns_per_cycle = Float.of_int ns_per_cycle
+    ; now = 0.
+    ; prev = 0 (* a frame needs a falling edge: the line must have been idle (high) first *)
+    ; frame_start = None
+    ; sampled = 0
+    ; shift = 0
+    ; received = []
+    ; errors = []
+    ; worst_edge = 0.
+    ; to_send = Queue.of_list words
+    ; tx_start = 0.
+    ; tx_byte = None
+    }
+  ;;
+
+  (* the level it drives this cycle *)
+  let tx_level t =
+    (match t.tx_byte with
+     | None ->
+       (* start the next frame after at least one idle bit *)
+       if Float.(t.now >= t.tx_start)
+       then
+         Option.iter (Queue.dequeue t.to_send) ~f:(fun b ->
+           t.tx_byte <- Some b;
+           t.tx_start <- t.now)
+     | Some _ -> ());
+    match t.tx_byte with
+    | None -> 1
+    | Some b ->
+      let k = Float.iround_down_exn ((t.now -. t.tx_start) /. t.bit_ns) in
+      if k = 0
+      then 0
+      else if k <= 8
+      then (b lsr (k - 1)) land 1
+      else (
+        if k >= 10
+        then (
+          t.tx_byte <- None;
+          t.tx_start <- t.tx_start +. (11. *. t.bit_ns));
+        1)
+  ;;
+
+  (* the level it sees from the chip this cycle *)
+  let rx_step t level =
+    (match t.frame_start with
+     | None -> if level = 0 && t.prev = 1 then t.frame_start <- Some t.now
+     | Some f ->
+       if level <> t.prev
+       then (
+         let bits = (t.now -. f) /. t.bit_ns in
+         let off = Float.abs (bits -. Float.round_nearest bits) in
+         t.worst_edge <- Float.max t.worst_edge off);
+       let next_sample = f +. ((Float.of_int t.sampled +. 0.5) *. t.bit_ns) in
+       if Float.(t.now >= next_sample)
+       then (
+         (match t.sampled with
+          | 0 -> if level <> 0 then t.errors <- "start bit not low" :: t.errors
+          | 9 ->
+            if level <> 1 then t.errors <- "framing error" :: t.errors;
+            t.received <- t.shift :: t.received;
+            t.frame_start <- None
+          | k -> t.shift <- t.shift lor (level lsl (k - 1)));
+         if t.sampled = 9
+         then (
+           t.sampled <- 0;
+           t.shift <- 0)
+         else t.sampled <- t.sampled + 1));
+    t.prev <- level
+  ;;
+
+  let step t level =
+    let tx = tx_level t in
+    rx_step t level;
+    t.now <- t.now +. t.ns_per_cycle;
+    tx
+  ;;
+end
+

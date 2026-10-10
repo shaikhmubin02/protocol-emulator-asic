@@ -31,7 +31,39 @@ let%expect_test "uart.s: full-duplex loopback, back-to-back frames" =
   let got = Host.received host in
   if not ([%equal: int list] got sent) then raise_s [%message (got : int list) (sent : int list)];
   printf "%d words; echoed %s\n" (Array.length prog) (Sexp.to_string [%sexp (got : int list)]);
-  [%expect {| 27 words; echoed (0 255 85 165 60 129 126) |}]
+  [%expect {| 37 words; echoed (0 255 85 165 60 129 126) |}]
+;;
+
+(* At real baud rates against a UART on its own exact clock, both directions at once. The chip
+   is clocked at 50 MHz. *)
+let%expect_test "uart.s at 115200 and 9600 baud" =
+  List.iter [ 115200, 434, 8; 9600, 5208, 85 ] ~f:(fun (baud, whole, frac) ->
+    let prog = load "uart.s" in
+    let m = Model.create prog in
+    let to_chip = [ 0x55; 0x00; 0xFF; 0xA5; 0x3C; 0x81 ]
+    and from_chip = [ 0x12; 0xED; 0x80; 0x01; 0x7F; 0xC3 ] in
+    let host = Host.create ([ 0x8000 lor whole; 0x4000 lor frac ] @ from_chip) in
+    (* the far end starts sending once the bit time is set *)
+    let far = Uart_line.create ~baud ~ns_per_cycle:20 [] in
+    let cycles = 14 * 10 * (whole + 1) in
+    for cycle = 1 to cycles do
+      if cycle = 200 then List.iter to_chip ~f:(Queue.enqueue far.to_send);
+      let rx = Uart_line.step far (bit (Model.uo_out m) 0) in
+      Model.step m { Model.Pads.zero with ui_in = rx lsl 3 };
+      Host.service host m
+    done;
+    let got = Host.received host
+    and far_got = List.rev far.received in
+    if not (List.is_empty far.errors) then raise_s [%message (far.errors : string list)];
+    if not ([%equal: int list] got to_chip) then raise_s [%message (baud : int) (got : int list)];
+    if not ([%equal: int list] far_got from_chip)
+    then raise_s [%message (baud : int) (far_got : int list)];
+    printf "%6d baud: both directions ok, worst TX edge %.2f%% of a bit from ideal\n" baud
+      (100. *. far.worst_edge));
+  [%expect {|
+    115200 baud: both directions ok, worst TX edge 0.22% of a bit from ideal
+      9600 baud: both directions ok, worst TX edge 0.01% of a bit from ideal
+    |}]
 ;;
 
 (* ---------------- SPI ---------------- *)
