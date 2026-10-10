@@ -276,3 +276,61 @@ let%expect_test "onewire.s reads a device's ROM ID (another protocol it wasn't d
     |}]
 ;;
 
+(* ---------------- USB low speed ---------------- *)
+
+let%expect_test "usb_tx.s: low-speed packets, checked by a receiver written from the USB spec" =
+  let prog = load "usb_tx.s" in
+  let m = Model.create prog in
+  (* at 48 MHz *)
+  let rx = Usb_ls_receiver.create ~ns_per_cycle:(1e9 /. 48e6) in
+  let data b = 0x200 lor b
+  and raw b = 0x300 lor b in
+  let setup = [ 0x80; 0x06; 0x00; 0x01; 0x00; 0x00; 0x40; 0x00 ] (* GET_DESCRIPTOR *) in
+  let words =
+    (* SETUP token to address 0, endpoint 0 (the CRC-5 is part of the second byte) *)
+    [ 0x12D; raw 0x00; raw 0x10; 0x500 ]
+    (* DATA0 with the setup request *)
+    @ [ 0x1C3 ] @ List.map setup ~f:data @ [ 0x400 ]
+    (* ACK *)
+    @ [ 0x1D2; 0x500 ]
+    (* zero-length DATA1: its CRC field is 00 00 *)
+    @ [ 0x14B; 0x400 ]
+    (* lots of 1s, so lots of stuffing *)
+    @ [ 0x1C3 ] @ List.map [ 0xFF; 0xFF; 0xFF; 0x7F; 0xFE ] ~f:data @ [ 0x400 ]
+  in
+  let host = Host.create words in
+  for _ = 1 to 40_000 do
+    Model.step m Model.Pads.zero;
+    let oe = Model.uio_oe m
+    and out = Model.uio_out m in
+    (* D+ has the host's pull-down, D- the device's pull-up *)
+    let dp = if bit oe 4 = 1 then bit out 4 else 0
+    and dm = if bit oe 5 = 1 then bit out 5 else 1 in
+    Usb_ls_receiver.step rx ~dp ~dm;
+    Host.service host m
+  done;
+  if not (List.is_empty rx.errors) then raise_s [%message (rx.errors : string list)];
+  (* the spec allows 95 ns; the firmware is meant to be exact, so anything over a cycle means a
+     bit boundary was missed *)
+  if Float.(rx.worst_jitter_ns > 1e9 /. 48e6 /. 2.)
+  then raise_s [%message "a bit boundary was late" (rx.worst_jitter_ns : float)];
+  printf "%d words, worst transition %.1f ns off the bit grid\n" (Array.length prog)
+    rx.worst_jitter_ns;
+  List.iter (List.rev rx.packets) ~f:(fun p ->
+    printf "PID %02X  data [%s]%s  stuffed bits %d\n" p.pid
+      (String.concat ~sep:" " (List.map p.data ~f:(sprintf "%02X")))
+      (match p.crc_ok with
+       | Some true -> "  CRC-16 ok"
+       | Some false -> "  CRC-16 WRONG"
+       | None -> "")
+      p.stuffed);
+  [%expect {|
+    89 words, worst transition 0.0 ns off the bit grid
+    PID 2D  data [00 10]  stuffed bits 0
+    PID C3  data [80 06 00 01 00 00 40 00]  CRC-16 ok  stuffed bits 0
+    PID D2  data []  stuffed bits 0
+    PID 4B  data []  CRC-16 ok  stuffed bits 0
+    PID C3  data [FF FF FF 7F FE]  CRC-16 ok  stuffed bits 7
+    |}]
+;;
+

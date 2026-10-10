@@ -234,3 +234,19 @@ let%expect_test "onewire.s in lockstep against a 1-Wire device" =
   [%expect {| 60000 cycles in lockstep, replies (0 40 1 2 3 4 5 6 158), ROM matches true |}]
 ;;
 
+
+let%expect_test "usb_tx.s in lockstep" =
+  let ls = Lockstep.create (load "usb_tx.s") in
+  let pending =
+    Queue.of_list
+      ([ 0x1C3 ] @ List.map [ 0x80; 0x06; 0xFF; 0xFF; 0xFF; 0x00 ] ~f:(fun b -> 0x200 lor b)
+       @ [ 0x400; 0x1D2; 0x500 ])
+  in
+  for _ = 1 to 6_000 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int)
+  done;
+  printf "%d cycles in lockstep, %d words left\n" ls.cycle (Queue.length pending);
+  [%expect {| 6000 cycles in lockstep, 0 words left |}]
+;;

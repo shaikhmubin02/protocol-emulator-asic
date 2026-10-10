@@ -615,3 +615,173 @@ module Uart_line = struct
   ;;
 end
 
+(* CRC-16 of USB data packets: x^16 + x^15 + x^2 + 1, LSB first, starting at all ones; the
+   packet carries it inverted *)
+let crc16_usb bytes =
+  List.fold bytes ~init:0xFFFF ~f:(fun crc b ->
+    let crc = ref crc in
+    for k = 0 to 7 do
+      let fb = (!crc lxor (b lsr k)) land 1 in
+      crc := !crc lsr 1;
+      if fb = 1 then crc := !crc lxor 0xA001
+    done;
+    !crc)
+;;
+
+(* The receiving end of a USB low-speed link, from the USB 2.0 spec (chapters 7 and 8). It
+   watches D+ and D-; with the 1.5k pull-up on D-, a line nobody drives reads J. It records each
+   packet from its first K to the end of packet (SE0, then J), then decodes it: samples the middle
+   of each bit on the grid set by the first transition, undoes NRZI (a change is a 0) and bit
+   stuffing (after six 1s comes a 0 that isn't data), and checks:
+   - every transition is within 95 ns of that grid (low-speed source jitter, table 7-9 TDJ1),
+   - SE0 at the end lasts 1.25-1.5 us (TEOPT),
+   - SYNC is 00000001, the PID's top nibble is the inverse of its bottom nibble,
+   - no stuffing errors, whole bytes, and the CRC-16 of data packets,
+   - at least 2 bit times of idle between packets. *)
+module Usb_ls_receiver = struct
+  type line =
+    | J
+    | K
+    | Se0
+    | Se1
+  [@@deriving equal, sexp_of]
+
+  type packet =
+    { pid : int
+    ; data : int list (* without the CRC-16 for data packets *)
+    ; crc_ok : bool option
+    ; stuffed : int
+    }
+  [@@deriving sexp_of]
+
+  type t =
+    { ns_per_cycle : float
+    ; bit_ns : float
+    ; mutable now : float
+    ; mutable prev : line
+    ; mutable start : float option (* first K of the packet *)
+    ; mutable states : (float * line) list (* transitions in this packet, newest first *)
+    ; mutable se0_from : float option
+    ; mutable idle_from : float
+    ; mutable packets : packet list (* newest first *)
+    ; mutable errors : string list
+    ; mutable worst_jitter_ns : float
+    }
+
+  let create ~ns_per_cycle =
+    { ns_per_cycle
+    ; bit_ns = 1e9 /. 1.5e6
+    ; now = 0.
+    ; prev = J
+    ; start = None
+    ; states = []
+    ; se0_from = None
+    ; idle_from = -1e9
+    ; packets = []
+    ; errors = []
+    ; worst_jitter_ns = 0.
+    }
+  ;;
+
+  let error t s = t.errors <- sprintf "%.0f ns: %s" t.now s :: t.errors
+
+  let decode t ~start ~se0_from =
+    let states = List.rev t.states in
+    (* the line in the middle of bit k: the last transition before that time *)
+    let level_at time =
+      List.fold states ~init:K ~f:(fun acc (at, l) -> if Float.(at <= time) then l else acc)
+    in
+    let n_bits = Float.iround_nearest_exn ((se0_from -. start) /. t.bit_ns) in
+    let prev = ref J
+    and ones = ref 0
+    and bits = ref []
+    and stuffed = ref 0 in
+    for k = 0 to n_bits - 1 do
+      let l = level_at (start +. ((Float.of_int k +. 0.5) *. t.bit_ns)) in
+      let b = if equal_line l !prev then 1 else 0 in
+      prev := l;
+      if !ones = 6
+      then (
+        if b = 1 then error t "bit stuffing error";
+        incr stuffed;
+        ones := 0)
+      else (
+        bits := b :: !bits;
+        if b = 1 then incr ones else ones := 0)
+    done;
+    let bits = List.rev !bits in
+    let rec bytes = function
+      | [] -> []
+      | l when List.length l < 8 ->
+        error t (sprintf "%d bits left over" (List.length l));
+        []
+      | l ->
+        let b = List.take l 8
+        and rest = List.drop l 8 in
+        List.foldi b ~init:0 ~f:(fun k acc x -> acc lor (x lsl k)) :: bytes rest
+    in
+    match bytes bits with
+    | sync :: pid :: rest ->
+      if sync <> 0x80 then error t (sprintf "SYNC was %02x" sync);
+      if (pid lsr 4) lxor 0xF <> pid land 0xF then error t (sprintf "bad PID %02x" pid);
+      let is_data = List.mem [ 0xC3; 0x4B; 0x87; 0x0F ] pid ~equal:Int.equal in
+      let data, crc_ok =
+        if is_data && List.length rest >= 2
+        then (
+          let data = List.drop_last_exn (List.drop_last_exn rest) in
+          let crc = lnot (crc16_usb data) land 0xFFFF in
+          let sent =
+            match List.drop rest (List.length data) with
+            | [ lo; hi ] -> lo lor (hi lsl 8)
+            | _ -> -1
+          in
+          data, Some (crc = sent))
+        else rest, None
+      in
+      if Poly.equal crc_ok (Some false) then error t "CRC-16 wrong";
+      t.packets <- { pid; data; crc_ok; stuffed = !stuffed } :: t.packets
+    | _ -> error t "packet too short"
+  ;;
+
+  let step t ~dp ~dm =
+    let l =
+      match dp, dm with
+      | 0, 1 -> J
+      | 1, 0 -> K
+      | 0, 0 -> Se0
+      | _ -> Se1
+    in
+    if not (equal_line l t.prev)
+    then (
+      if equal_line l Se1 then error t "SE1 on the line";
+      match t.start with
+      | None ->
+        if equal_line l K
+        then (
+          if Float.(t.now -. t.idle_from < 2. *. t.bit_ns)
+          then error t "less than 2 bit times between packets";
+          t.start <- Some t.now;
+          t.states <- [ t.now, K ])
+      | Some start ->
+        let bits = (t.now -. start) /. t.bit_ns in
+        let off = Float.abs (bits -. Float.round_nearest bits) *. t.bit_ns in
+        t.worst_jitter_ns <- Float.max t.worst_jitter_ns off;
+        if Float.(off > 95.) then error t (sprintf "transition %.0f ns off the bit grid" off);
+        t.states <- (t.now, l) :: t.states;
+        if equal_line l Se0 then t.se0_from <- Some t.now;
+        if equal_line l J && equal_line t.prev Se0
+        then (
+          let se0_from = Option.value_exn t.se0_from in
+          let width = t.now -. se0_from in
+          if Float.(width < 1250. || width > 1500.)
+          then error t (sprintf "SE0 for %.0f ns" width);
+          decode t ~start ~se0_from;
+          t.start <- None;
+          t.states <- [];
+          t.se0_from <- None;
+          t.idle_from <- t.now));
+    t.prev <- l;
+    t.now <- t.now +. t.ns_per_cycle
+  ;;
+end
+
