@@ -250,3 +250,24 @@ let%expect_test "usb_tx.s in lockstep" =
   printf "%d cycles in lockstep, %d words left\n" ls.cycle (Queue.length pending);
   [%expect {| 6000 cycles in lockstep, 0 words left |}]
 ;;
+
+let%expect_test "usb_rx.s in lockstep, fed 1.5% slow" =
+  let ls = Lockstep.create (load "usb_rx.s") in
+  let far =
+    Devices.Usb_ls_transmitter.create
+      ~bit_ns:(1e9 /. 1.5e6 *. 1.015)
+      ~ns_per_cycle:(1e9 /. 48e6)
+      ~gap_bits:2
+      [ 0xC3, [ 0x80; 0x06; 0xFF; 0xFF ]; 0xD2, [] ]
+  in
+  let got = ref 0 in
+  for _ = 1 to 8_000 do
+    let dp, dm = Devices.Usb_ls_transmitter.step far in
+    let read, _ =
+      Lockstep.step ~receive:true ls { Model.Pads.zero with uio_in = (dp lsl 4) lor (dm lsl 5) }
+    in
+    Option.iter read ~f:(fun _ -> incr got)
+  done;
+  printf "%d cycles in lockstep, %d words received\n" ls.cycle !got;
+  [%expect {| 8000 cycles in lockstep, 10 words received |}]
+;;

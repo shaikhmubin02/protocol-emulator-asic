@@ -785,3 +785,78 @@ module Usb_ls_receiver = struct
   ;;
 end
 
+(* A USB low-speed transmitter to drive the chip's receiver, from the same spec: whole packets
+   (SYNC, PID, data, the inverted CRC-16 after a data PID) bit-stuffed, NRZI-coded from J, each
+   ended by SE0, SE0, J, with idle J between. It plays them out at [bit_ns], which can be set off
+   the nominal rate to test clock recovery. *)
+module Usb_ls_transmitter = struct
+  type t =
+    { bit_ns : float
+    ; ns_per_cycle : float
+    ; mutable now : float
+    ; states : Usb_ls_receiver.line array
+    }
+
+  let data_pids = [ 0xC3; 0x4B; 0x87; 0x0F ]
+
+  let encode (pid, data) =
+    let bytes =
+      [ 0x80; pid ]
+      @ data
+      @
+      if List.mem data_pids pid ~equal:Int.equal
+      then (
+        let crc = lnot (crc16_usb data) land 0xFFFF in
+        [ crc land 0xFF; crc lsr 8 ])
+      else []
+    in
+    let line = ref Usb_ls_receiver.J
+    and ones = ref 0
+    and out = ref [] in
+    let toggle () =
+      line
+      := match !line with
+         | J -> K
+         | _ -> J
+    in
+    let send b =
+      if b = 0
+      then (
+        toggle ();
+        ones := 0)
+      else incr ones;
+      out := !line :: !out;
+      if !ones = 6
+      then (
+        toggle ();
+        ones := 0;
+        out := !line :: !out)
+    in
+    List.iter bytes ~f:(fun byte ->
+      for k = 0 to 7 do
+        send ((byte lsr k) land 1)
+      done);
+    List.rev !out @ [ Usb_ls_receiver.Se0; Se0; J ]
+  ;;
+
+  let create ~bit_ns ~ns_per_cycle ?(gap_bits = 8) packets =
+    let idle = List.init gap_bits ~f:(fun _ -> Usb_ls_receiver.J) in
+    { bit_ns
+    ; ns_per_cycle
+    ; now = 0.
+    ; states = Array.of_list (idle @ List.concat_map packets ~f:(fun p -> encode p @ idle))
+    }
+  ;;
+
+  (* (D+, D-) this cycle *)
+  let step t =
+    let k = Float.iround_down_exn (t.now /. t.bit_ns) in
+    t.now <- t.now +. t.ns_per_cycle;
+    match if k < Array.length t.states then t.states.(k) else J with
+    | J -> 0, 1
+    | K -> 1, 0
+    | Se0 -> 0, 0
+    | Se1 -> 1, 1
+  ;;
+end
+

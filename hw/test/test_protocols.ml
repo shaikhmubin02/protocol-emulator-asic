@@ -334,3 +334,108 @@ let%expect_test "usb_tx.s: low-speed packets, checked by a receiver written from
     |}]
 ;;
 
+(* the receiver's words split into packets: the bytes, and the CRC flag of the last one *)
+let usb_rx_packets words =
+  let rec go acc cur = function
+    | [] -> List.rev acc
+    | 0x8000 :: rest ->
+      let cur = List.rev cur in
+      let crc_flag = Option.value_map (List.last cur) ~default:false ~f:(fun w -> w land 0x100 <> 0) in
+      go ((List.map cur ~f:(fun w -> w land 0xFF), crc_flag) :: acc) [] rest
+    | w :: rest -> go acc (w :: cur) rest
+  in
+  go [] [] words
+;;
+
+let usb_test_packets =
+  [ 0x2D, [ 0x00; 0x10 ] (* SETUP token *)
+  ; 0xC3, [ 0x80; 0x06; 0x00; 0x01; 0x00; 0x00; 0x40; 0x00 ]
+  ; 0xD2, [] (* ACK *)
+  ; 0x4B, [ 0xFF; 0xFF; 0xFF; 0x7F; 0xFE; 0x01 ]
+  ; 0x4B, [] (* zero-length *)
+  ]
+;;
+
+let usb_expected =
+  List.map usb_test_packets ~f:(fun (pid, data) ->
+    let is_data = List.mem Usb_ls_transmitter.data_pids pid ~equal:Int.equal in
+    let crc =
+      if is_data
+      then (
+        let c = lnot (crc16_usb data) land 0xFFFF in
+        [ c land 0xFF; c lsr 8 ])
+      else []
+    in
+    pid :: (data @ crc), is_data)
+;;
+
+let%expect_test "usb_rx.s: clock recovery, NRZI, unstuffing and CRC-16, at 1.5 Mbit/s +-1.5%" =
+  let prog = load "usb_rx.s" in
+  List.iter [ "nominal", 1.0; "1.5% slow", 1.015; "1.5% fast", 1. /. 1.015 ] ~f:(fun (name, k) ->
+    let m = Model.create prog in
+    let far =
+      Usb_ls_transmitter.create
+        ~bit_ns:(1e9 /. 1.5e6 *. k)
+        ~ns_per_cycle:(1e9 /. 48e6)
+        ~gap_bits:2 (* the least the spec allows between packets *)
+        usb_test_packets
+    in
+    let overrun = ref false in
+    let host = Host.create [] in
+    for _ = 1 to 40_000 do
+      let dp, dm = Usb_ls_transmitter.step far in
+      Model.step m { Model.Pads.zero with uio_in = (dp lsl 4) lor (dm lsl 5) };
+      if m.be.overrun then overrun := true;
+      Host.service host m
+    done;
+    if !overrun then raise_s [%message name "the receiver fell behind (RX overrun)"];
+    let got = usb_rx_packets (Host.received host) in
+    let ok =
+      List.length got = List.length usb_expected
+      && List.for_all2_exn got usb_expected ~f:(fun (b, flag) (e, is_data) ->
+        [%equal: int list] b e && ((not is_data) || flag))
+    in
+    if not ok then raise_s [%message name (got : (int list * bool) list)];
+    printf "%-9s %d packets, all bytes right, CRC-16 good on every data packet\n" name
+      (List.length got));
+  [%expect {|
+    nominal   5 packets, all bytes right, CRC-16 good on every data packet
+    1.5% slow 5 packets, all bytes right, CRC-16 good on every data packet
+    1.5% fast 5 packets, all bytes right, CRC-16 good on every data packet
+    |}]
+;;
+
+(* the chip's transmitter into its own receiver: one engine sending, another listening *)
+let%expect_test "usb_tx.s into usb_rx.s" =
+  let tx = Model.create (load "usb_tx.s")
+  and rx = Model.create (load "usb_rx.s") in
+  let words =
+    List.concat_map usb_test_packets ~f:(fun (pid, data) ->
+      let is_data = List.mem Usb_ls_transmitter.data_pids pid ~equal:Int.equal in
+      [ 0x100 lor pid ]
+      @ List.map data ~f:(fun b -> (if is_data then 0x200 else 0x300) lor b)
+      @ [ (if is_data then 0x400 else 0x500) ])
+  in
+  let tx_host = Host.create words
+  and rx_host = Host.create [] in
+  for _ = 1 to 40_000 do
+    Model.step tx Model.Pads.zero;
+    let oe = Model.uio_oe tx
+    and out = Model.uio_out tx in
+    let dp = if bit oe 4 = 1 then bit out 4 else 0
+    and dm = if bit oe 5 = 1 then bit out 5 else 1 in
+    Model.step rx { Model.Pads.zero with uio_in = (dp lsl 4) lor (dm lsl 5) };
+    Host.service tx_host tx;
+    Host.service rx_host rx
+  done;
+  let got = usb_rx_packets (Host.received rx_host) in
+  let ok =
+    List.length got = List.length usb_expected
+    && List.for_all2_exn got usb_expected ~f:(fun (b, flag) (e, is_data) ->
+      [%equal: int list] b e && ((not is_data) || flag))
+  in
+  if not ok then raise_s [%message (got : (int list * bool) list)];
+  printf "%d packets sent by one engine and received by another, all intact\n" (List.length got);
+  [%expect {| 5 packets sent by one engine and received by another, all intact |}]
+;;
+
