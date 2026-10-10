@@ -77,23 +77,7 @@ let scatter mask stored =
        | None -> gnd))
 ;;
 
-(* rotate a 17-bit value left by m (0..16) *)
-let rotl17 v m =
-  List.foldi (bits_lsb m) ~init:v ~f:(fun k acc b -> mux2 b (rotl acc ~by:(1 lsl k)) acc)
-;;
-
-(* [width] bits, bit j set when j < k *)
 let below k ~width = concat_lsb (List.init width ~f:(fun j -> of_int_trunc ~width:(Signal.width k) j <: k))
-
-let mod17 n =
-  (* n is 6 bits *)
-  let n7 = uresize n ~width:7 in
-  mux2
-    (n7 >=:. 51)
-    (n7 -:. 51)
-    (mux2 (n7 >=:. 34) (n7 -:. 34) (mux2 (n7 >=:. 17) (n7 -:. 17) n7))
-  |> fun r -> r.:[4, 0]
-;;
 
 module Mode = struct
   type t =
@@ -111,6 +95,7 @@ module Mode = struct
 end
 
 module Fab = Fabric_logic.Make (Signal)
+module Alu_s = Alu.Make (Signal)
 
 let n_le = 8
 
@@ -241,34 +226,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   (* ---------- ALU ---------- *)
   let a = reg_a
   and b = reg_b in
-  let n16 = uresize imm6 ~width:16 in
-  (* one adder and one subtractor serve ADD/SUB/CMP and their immediate forms *)
-  let y = mux2 (is 3) n16 b in
-  let sum = uresize a ~width:17 +: uresize y ~width:17 in
-  let diff17 = uresize a ~width:17 -: uresize y ~width:17 in
-  let diff = diff17.:[15, 0] in
-  let borrow = msb diff17 in
-  let alu_fn = f 5 3 in
-  let alu_res = mux alu_fn [ b; sum.:[15, 0]; diff; a &: b; a |: b; a ^: b; diff; a &: b ] in
-  let alu_writes = alu_fn <:. 6 in
-  let alui_fn = f 8 6 in
-  (* SHLI, SHRI, RLC and RRC share one 17-bit rotator. A shift is a rotation of {0, a} with
-     the bits that wrapped around cleared; the carry lands in bit 16 either way. *)
-  let m = mod17 imm6 in
-  let big = imm6 >=:. 17 in
-  let rotating = (alui_fn ==:. 5) |: (alui_fn ==:. 6) in
-  let left = (alui_fn ==:. 3) |: (alui_fn ==:. 5) in
-  let seventeen = of_int_trunc ~width:5 17 in
-  let amount = mux2 left m (mux2 (m ==:. 0) (zero 5) (seventeen -: m)) in
-  let rot = rotl17 (mux2 rotating c.value gnd @: a) amount in
-  let shl = mux2 big (zero 16) (rot.:[15, 0] &: ~:(below m ~width:16)) in
-  let shr = mux2 big (zero 16) (rot.:[15, 0] &: below (seventeen -: m) ~width:16) in
-  let shift_carry = mux2 (imm6 ==:. 0) c.value (~:big &: rot.:[16, 16]) in
-  let alui_res =
-    mux alui_fn [ sum.:[15, 0]; diff; diff; shl; shr; rot.:[15, 0]; rot.:[15, 0]; a ]
-  in
-  let alui_writes = ~:((alui_fn ==:. 2) |: (alui_fn ==:. 7)) in
-  let tstb_zero = ~:(mux imm6.:[3, 0] (bits_lsb a)) in
+  let alu = Alu_s.create ~imm:(is 3) ~alu_fn:(f 5 3) ~alui_fn:(f 8 6) ~imm6 ~a ~b ~c_in:c.value in
   (* ---------- conditions ---------- *)
   let jpin = read_pin (csr_value Isa.Csr.jpin) in
   let jflag = mux (csr_value Isa.Csr.jflag) flag_list in
@@ -401,8 +359,8 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
       op
       [ mux2 (sys 8) rx_word.value in_e0.value (* RX / PULL *)
       ; mux2 (f 8 8) (imm8 @: a.:[7, 0]) (uresize imm8 ~width:16)
-      ; alu_res
-      ; alui_res
+      ; alu.result
+      ; alu.result
       ; a
       ; dec
       ; a
@@ -420,8 +378,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   let wb_en =
     exec
     &: (is 1
-        |: (is 2 &: alu_writes)
-        |: (is 3 &: alui_writes)
+        |: ((is 2 |: is 3) &: alu.writes)
         |: is 5
         |: is 9
         |: is 12
@@ -429,35 +386,13 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
         |: (sys 8 &: ready))
   in
   (* flags *)
-  let z_new =
-    mux2
-      (is 1)
-      (wb_val ==:. 0)
-      (mux2
-         (is 2)
-         (mux2 (alu_fn ==:. 6) (diff ==:. 0) (mux2 (alu_fn ==:. 7) ((a &: b) ==:. 0) (alu_res ==:. 0)))
-         (mux2 (alui_fn ==:. 7) tstb_zero (mux2 (alui_fn ==:. 2) (diff ==:. 0) (alui_res ==:. 0))))
-  in
+  let z_new = mux2 (is 1) (wb_val ==:. 0) alu.z in
   let z_en = exec &: (is 1 |: is 2 |: is 3) in
-  let c_new_alu = mux (uresize alu_fn ~width:3) [ c.value; sum.:[16, 16]; borrow; c.value; c.value; c.value; borrow; c.value ] in
-  let c_new_alui =
-    mux
-      alui_fn
-      [ sum.:[16, 16]
-      ; borrow
-      ; borrow
-      ; shift_carry
-      ; shift_carry
-      ; rot.:[16, 16]
-      ; rot.:[16, 16]
-      ; c.value
-      ]
-  in
   let pin_p = f 9 5 in
   let pin_mode = f 4 3 in
   let pin_op = f 11 10 in
   let sample = is 7 &: (pin_mode ==:. 3) in
-  let c_new = mux2 (is 2) c_new_alu (mux2 (is 3) c_new_alui (read_pin pin_p)) in
+  let c_new = mux2 (is 2 |: is 3) alu.c (read_pin pin_p) in
   let c_en = exec &: (is 2 |: is 3 |: sample) in
   (* ---------- pin drive (PIN / OUTG) ---------- *)
   let out_now k = out.(k).value in
