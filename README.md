@@ -20,9 +20,11 @@ Firmware in `hw/firmware`, each one tested against a model of the device on the 
   the I2C spec
 - WS2812 LED chains
 - 1-Wire, including reading a device's ROM ID
+- USB low speed: sending and receiving packets, with the line coding, clock recovery and CRC-16
+  done on the chip (tested at the 1.5% clock error the spec allows)
 
-USB low speed and 10BASE-T are next; engines 0 and 1 have a small LUT fabric and a CRC unit for
-the bit-level coding those need.
+10BASE-T is next. Engines 0 and 1 also have a small LUT fabric and a CRC unit for bit-level
+coding.
 
 ## How it's checked
 

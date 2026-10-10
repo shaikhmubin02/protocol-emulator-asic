@@ -47,7 +47,7 @@ reading the outbox, and only write the inbox when it has room.
 ### Example firmware
 
 All of these are in `hw/firmware` and assemble with the assembler in `hw/bin`. Times assume a
-50 MHz clock; each file says which numbers to change for another clock.
+50 MHz clock unless the row says otherwise; each file says which numbers to change for another clock.
 
 | File | Protocol | Pins | Host words |
 |---|---|---|---|
@@ -56,6 +56,8 @@ All of these are in `hw/firmware` and assemble with the assembler in `hw/bin`. T
 | `i2c_master.s` | I2C controller, 100 and 400 kHz, clock stretching | SCL uio[0], SDA uio[1] | `0x100` START, `0x2xx` write (reply 0 for ACK, 1 for NACK), `0x300` / `0x400` read with ACK / NACK, `0x500` STOP, `0x6xx` speed (100 = 100 kHz, 25 = 400 kHz) |
 | `ws2812.s` | WS2812 LED chain | DIN uo[0] | 16 bits of colour per word, GRB, MSB first. The LEDs latch when the words stop |
 | `onewire.s` | 1-Wire controller | DQ uio[2] | `0x100` reset (reply 0 if a device answered), `0x2xx` write, `0x300` read, `0x4xx` cycles per microsecond |
+| `usb_tx.s` | USB low speed, sending packets (48 MHz clock) | D+ uio[4], D- uio[5] | `0x1pp` SYNC and PID, `0x2dd` data byte, `0x3dd` byte outside the CRC, `0x400` CRC-16 and end of packet, `0x500` end of packet. SYNC, NRZI, bit stuffing, CRC-16 and EOP are done on the chip |
+| `usb_rx.s` | USB low speed, receiving packets (48 MHz clock) | D+ uio[4], D- uio[5] | replies: each byte, with bit 8 set once the CRC-16 checks out; `0x8000` at the end of each packet. Clock recovery, NRZI, unstuffing, SE0 and the CRC check are done on the chip |
 
 ## How to test
 
@@ -88,3 +90,5 @@ talk to, on a Pmod:
 - WS2812 LEDs usually want 5 V power; their data input generally works from 3.3 V for short
   chains, otherwise add a level shifter.
 - UART, SPI: direct connection at 3.3 V.
+- USB low speed: series resistors on D+ and D- and a 1.5 k pull-up on D- (for a device), as for any
+  3.3 V USB implementation.
