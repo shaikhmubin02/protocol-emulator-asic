@@ -4,7 +4,7 @@ open Pemu
 let bit v k = (v lsr k) land 1
 
 (* how much of the bit engine the random programs reach *)
-let coverage = Array.create ~len:8 0
+let coverage = Array.create ~len:9 0
 
 let run_random ?(lite = false) ~seed ~cycles () =
   let rng = Random.State.make [| seed |] in
@@ -40,7 +40,8 @@ let run_random ?(lite = false) ~seed ~cycles () =
     bump 6 (m.be.crc <> crc_before && m.be.crc <> step_with_zero && m.be.crc <> m.be.crc_init);
     bump 7 (Array.existsi m.be.fab_cfg ~f:(fun k cfg ->
       Hardcaml.Bits.to_bool (Model.Fab.rx_clocked cfg)
-      && Hardcaml.Bits.to_int_trunc m.be.fab_q.(k) <> q_before.(k)))
+      && Hardcaml.Bits.to_int_trunc m.be.fab_q.(k) <> q_before.(k)));
+    bump 8 (m.be.crc_out && m.be.sh_left < left_before)
   done
 ;;
 
@@ -53,18 +54,19 @@ let%expect_test "random programs: RTL = model every cycle" =
   done;
   printf "%d random programs x %d cycles: no difference\n" programs cycles;
   printf
-    "bit engine: on %d, TX bits %d, RX words %d, CRC steps %d (data=1: %d), fabric changes %d (RX-clocked: %d), RX starts/aligns %d\n"
+    "bit engine: on %d, TX bits %d, RX words %d, CRC steps %d (data=1: %d), CRC bits sent %d, fabric changes %d (RX-clocked: %d), RX starts/aligns %d\n"
     coverage.(0)
     coverage.(1)
     coverage.(2)
     coverage.(3)
     coverage.(6)
+    coverage.(8)
     coverage.(4)
     coverage.(7)
     coverage.(5);
   [%expect {|
     300 random programs x 2000 cycles: no difference
-    bit engine: on 351195, TX bits 3192, RX words 2516, CRC steps 65979 (data=1: 22858), fabric changes 78265 (RX-clocked: 60030), RX starts/aligns 30085
+    bit engine: on 341747, TX bits 4732, RX words 2545, CRC steps 69698 (data=1: 27914), CRC bits sent 3703, fabric changes 85376 (RX-clocked: 66397), RX starts/aligns 25681
     |}]
 ;;
 

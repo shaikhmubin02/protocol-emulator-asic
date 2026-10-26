@@ -76,7 +76,10 @@ let create rng =
         Random.State.int rng 16 lor (Random.State.int rng 2 lsl 4) lor (pin () lsl 5)
         lor (Random.State.int rng 2 lsl 10) lor (Random.State.int rng 2 lsl 11)
         lor ((1 + Random.State.int rng 3) lsl 12)
-      and crcctl = 1 lor (Random.State.int rng 3 lsl 1) lor (Random.State.int rng 2 lsl 3) in
+      and crcctl =
+        1 lor (Random.State.int rng 3 lsl 1) lor (Random.State.int rng 2 lsl 3)
+        lor (Random.State.int rng 2 lsl 4)
+      in
       List.concat
         [ set Isa.Csr.txcfg txcfg 0
         ; set Isa.Csr.rxcfg rxcfg 1

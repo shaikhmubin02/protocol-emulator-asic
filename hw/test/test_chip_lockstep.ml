@@ -195,8 +195,8 @@ let%expect_test "whole chip against the chip model, random programs and host tra
     !restarts
     !program_reads;
   [%expect {|
-    16 seeds, 1306861 cycles, no differences
-    engine-cycles 1878358, driven pin-cycles 583325, flag changes 122
-    host words in 144, out 18, engine stops 52, program reloads 38
+    16 seeds, 1306149 cycles, no differences
+    engine-cycles 1873186, driven pin-cycles 528072, flag changes 117
+    host words in 142, out 38, engine stops 54, program reloads 35
     |}]
 ;;

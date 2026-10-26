@@ -173,6 +173,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   and rx_ready = var 1
   and overrun = var 1
   and crc = var 32
+  and crc_out = var 1
   and flag_latch = var 1 in
   let fab_q = Array.init n_le ~f:(fun _ -> var 1) in
   let cfg_word addr ~width =
@@ -470,7 +471,10 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   and sh_index_l = mux2 load (zero 5) sh_index.value in
   let have_bit = tx_tick &: (sh_left_l <>:. 0) in
   let pos = mux2 (bit txcfg 4) (n_tx -:. 1 -: sh_index_l) sh_index_l in
-  let tx_bit = mux pos.:[3, 0] (bits_lsb sh_value_l) in
+  (* CRCCTL[4] is taken at each load: the word's bits then come from the CRC register,
+     inverted, top bit first, and the CRC shifts along instead of taking them in *)
+  let crc_out_l = mux2 load (bit crcctl 4) crc_out.value in
+  let tx_bit = mux2 crc_out_l ~:(msb crc.value) (mux pos.:[3, 0] (bits_lsb sh_value_l)) in
   (* 2. RX sample *)
   let rx_sample = read_pin rx_pin in
   (* 3. fabric *)
@@ -503,10 +507,10 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   let crc_src = crcctl.:[2, 1] in
   let crc_bit = mux crc_src [ tx_bit; rx_b; role fabctl2.:[11, 9]; role fabctl2.:[11, 9] ] in
   let crc_go =
-    bit crcctl 0 &: mux crc_src [ consume; keep; tx_tick; tx_tick ]
+    mux2 crc_out_l consume (bit crcctl 0 &: mux crc_src [ consume; keep; tx_tick; tx_tick ])
   in
   let crc_step =
-    let fb = msb crc.value ^: crc_bit in
+    let fb = msb crc.value ^: crc_bit &: ~:crc_out_l in
     (crc.value.:[30, 0] @: gnd) ^: (crc_poly &: repeat fb ~count:32)
   in
   (* end of cycle: RX start / re-align, from start-of-cycle config *)
@@ -534,6 +538,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
     ; (* TX *)
       when_ load [ hold_v <-- gnd ]
     ; when_ (exec &: sys 7 &: ~:(hold_v.value)) [ hold <-- reg_c; hold_v <-- vdd ]
+    ; when_ load [ crc_out <-- bit crcctl 4 ]
     ; when_ tx_tick
         [ sh_value <-- sh_value_l
         ; sh_left <-- mux2 consume (sh_left_l -:. 1) sh_left_l
@@ -583,6 +588,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
                ; rx_ready <-- gnd
                ; overrun <-- gnd
                ; rx_active <-- (rx_start ==:. 0)
+               ; crc_out <-- gnd
                ]
                @ List.init n_le ~f:(fun k -> fab_q.(k) <-- Fab.init fab_cfg.(k)))
               [ be_en <-- gnd ]

@@ -51,6 +51,7 @@ type bit_engine =
   ; mutable completed : bool
   ; mutable overrun : bool
   ; mutable crc : int
+  ; mutable crc_out : bool (* the word being sent comes from the CRC *)
   ; mutable crc_poly : int
   ; mutable crc_init : int
   ; fab_cfg : Bits.t array
@@ -155,6 +156,7 @@ let create ?(lite = false) ?(mailbox_depth = 2) program =
       ; completed = false
       ; overrun = false
       ; crc = 0
+      ; crc_out = false
       ; crc_poly = 0
       ; crc_init = 0
       ; fab_cfg = Array.init n_le ~f:(fun _ -> Bits.zero Fabric_logic.cfg_bits)
@@ -544,7 +546,8 @@ let tick t ~tx_tick ~rx_tick =
       be.sh_value <- v;
       be.sh_left <- field tx ~hi:3 ~lo:0 + 1;
       be.sh_index <- 0;
-      be.hold <- None
+      be.hold <- None;
+      be.crc_out <- field t.csr.(Isa.Csr.crcctl) ~hi:4 ~lo:4 = 1
     | None -> ());
   let tx_bit =
     if (not tx_tick) || be.sh_left = 0
@@ -553,7 +556,9 @@ let tick t ~tx_tick ~rx_tick =
       let n = field tx ~hi:3 ~lo:0 + 1 in
       let pos = if field tx ~hi:4 ~lo:4 = 1 then n - 1 - be.sh_index else be.sh_index in
       (* modulo 16, so a TXCFG change in the middle of a word is still defined *)
-      Some ((be.sh_value lsr (pos land 15)) land 1))
+      if be.crc_out
+      then Some (1 - ((be.crc lsr 31) land 1))
+      else Some ((be.sh_value lsr (pos land 15)) land 1))
   in
   (* 2. RX sample *)
   let rx_sample = Bool.to_int (read_pin t (field rx ~hi:9 ~lo:5)) in
@@ -625,8 +630,10 @@ let tick t ~tx_tick ~rx_tick =
           if field rx ~hi:13 ~lo:12 <> 0 then be.rx_active <- false);
         Some b))
   in
-  (* 6. CRC *)
-  if field t.csr.(Isa.Csr.crcctl) ~hi:0 ~lo:0 = 1
+  (* 6. CRC: while it's being sent it just shifts out *)
+  if be.crc_out
+  then Option.iter consumed ~f:(fun _ -> be.crc <- (be.crc lsl 1) land mask32)
+  else if field t.csr.(Isa.Csr.crcctl) ~hi:0 ~lo:0 = 1
   then (
     match field t.csr.(Isa.Csr.crcctl) ~hi:2 ~lo:1 with
     | 0 -> Option.iter consumed ~f:(crc_step t)
@@ -669,6 +676,7 @@ let apply_pending t =
      be.rx_ready <- false;
      be.overrun <- false;
      be.rx_active <- field (rxcfg t) ~hi:13 ~lo:12 = 0;
+     be.crc_out <- false;
      Array.iteri be.fab_cfg ~f:(fun i cfg -> be.fab_q.(i) <- Fab.init cfg)
    | Some false -> be.enabled <- false
    | None -> ());
