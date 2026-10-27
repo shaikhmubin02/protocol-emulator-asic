@@ -327,3 +327,59 @@ let%expect_test "eth_rx.s in lockstep, fed 100 ppm fast" =
     (String.concat ~sep:" " (List.map !status ~f:(sprintf "0x%04x")));
   [%expect {| 6000 cycles in lockstep, frame ok, status 0x8040 |}]
 ;;
+
+let%expect_test "spi_target.s in lockstep, mode 3 at 1 MHz" =
+  let ls = Lockstep.create (load "spi_target.s") in
+  let ctrl =
+    Devices.Spi_controller.create ~mode:3 ~half_ns:500. ~ns_per_cycle:20.
+      [ [ 0x9F; 0x00; 0x00 ]; [ 0x05 ] ]
+  in
+  let pending = Queue.of_list [ 0x8003; 0xEF; 0x40; 0x18 ] in
+  let miso = ref None
+  and got = ref [] in
+  for _ = 1 to 4_000 do
+    let sck, mosi, cs = Devices.Spi_controller.step ctrl ~miso:!miso in
+    let send = Queue.peek pending in
+    let read, wrote =
+      Lockstep.step ?send ~receive:true ls
+        { Model.Pads.zero with ui_in = (sck lsl 5) lor (mosi lsl 6) lor (cs lsl 7) }
+    in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun w -> got := w :: !got);
+    miso := if bit (Lockstep.uio_oe ls) 0 = 1 then Some (bit (Lockstep.uio_out ls) 0) else None
+  done;
+  printf "%d cycles in lockstep; controller read %s; host got %s\n" ls.cycle
+    (Sexp.to_string [%sexp (List.rev ctrl.received : int list list)])
+    (Sexp.to_string [%sexp (List.rev !got : int list)]);
+  [%expect {| 4000 cycles in lockstep; controller read ((239 64 24)(255)); host got (159 0 0 256 5 256) |}]
+;;
+
+let%expect_test "i2c_target.s in lockstep, against i2c_master.s at 400 kHz" =
+  let ls = Lockstep.create (load "i2c_target.s") in
+  let master = Model.create (load "i2c_master.s") in
+  let mhost = Host.create [ 0x619; 0x100; 0x2A0; 0x210; 0x100; 0x2A1; 0x400; 0x500 ] in
+  let pending = Queue.of_list [ 0x50; 0x99 ] in
+  let line oe out k = if bit oe k = 1 then bit out k else 1 in
+  let scl = ref 1
+  and sda = ref 1
+  and got = ref [] in
+  for _ = 1 to 12_000 do
+    let pads = { Model.Pads.zero with uio_in = !scl lor (!sda lsl 1) } in
+    Model.step master pads;
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls pads in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun w -> got := w :: !got);
+    let mo = Model.uio_oe master
+    and mv = Model.uio_out master
+    and to_ = Lockstep.uio_oe ls
+    and tv = Lockstep.uio_out ls in
+    scl := line mo mv 0 land line to_ tv 0;
+    sda := line mo mv 1 land line to_ tv 1;
+    Host.service mhost master
+  done;
+  printf "%d cycles in lockstep; target sent the host %s; master read %s\n" ls.cycle
+    (Sexp.to_string [%sexp (List.rev_map !got ~f:(sprintf "0x%x") : string list)])
+    (Sexp.to_string [%sexp (Host.received mhost : int list)]);
+  [%expect {| 12000 cycles in lockstep; target sent the host (0x1a0 0x210 0x1a1 0x300); master read (0 0 0 153) |}]
+;;

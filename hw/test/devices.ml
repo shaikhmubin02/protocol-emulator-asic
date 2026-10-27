@@ -1092,3 +1092,113 @@ module Nibble_bus = struct
     t.dv <- dv
   ;;
 end
+
+(* ---------------- SPI controller (to test a target) ---------------- *)
+
+(* An SPI controller in any mode: each transaction lowers CS, waits [lead_ns] (half a bit by
+   default), sends its bytes MSB first with no gap between them, raises CS half a bit later,
+   then waits [gap_ns]. It samples MISO at the
+   sample edge, and complains if MISO isn't driven then. *)
+module Spi_controller = struct
+  type event =
+    { at : float
+    ; sck : int
+    ; mosi : int
+    ; cs : int
+    ; sample : bool
+    ; ends_byte : bool
+    }
+
+  type t =
+    { ns_per_cycle : float
+    ; events : event array
+    ; mutable next : int
+    ; mutable now : float
+    ; mutable sck : int
+    ; mutable mosi : int
+    ; mutable cs : int
+    ; mutable bits : int
+    ; mutable current : int list (* bytes of this transaction, newest first *)
+    ; mutable received : int list list (* newest first *)
+    ; mutable errors : string list
+    }
+
+  let create ~mode ~half_ns ~ns_per_cycle ?(lead_ns = half_ns) ?(gap_ns = 2000.) transactions =
+    let cpol = (mode lsr 1) land 1
+    and cpha = mode land 1 in
+    let events = ref []
+    and now = ref 1000. in
+    let add ?(sample = false) ?(ends_byte = false) ~sck ~mosi ~cs () =
+      events := { at = !now; sck; mosi; cs; sample; ends_byte } :: !events
+    in
+    List.iter transactions ~f:(fun bytes ->
+      let bits =
+        List.concat_map bytes ~f:(fun b -> List.init 8 ~f:(fun k -> (b lsr (7 - k)) land 1))
+      in
+      let first = Option.value (List.hd bits) ~default:0 in
+      add ~sck:cpol ~mosi:(if cpha = 0 then first else 0) ~cs:0 ();
+      now := !now +. lead_ns -. half_ns;
+      List.iteri bits ~f:(fun i b ->
+        let last = i mod 8 = 7 in
+        now := !now +. half_ns;
+        (* leading edge *)
+        if cpha = 0
+        then add ~sample:true ~ends_byte:last ~sck:(1 - cpol) ~mosi:b ~cs:0 ()
+        else add ~sck:(1 - cpol) ~mosi:b ~cs:0 ();
+        now := !now +. half_ns;
+        (* trailing edge *)
+        let next = Option.value (List.nth bits (i + 1)) ~default:b in
+        if cpha = 0
+        then add ~sck:cpol ~mosi:next ~cs:0 ()
+        else add ~sample:true ~ends_byte:last ~sck:cpol ~mosi:b ~cs:0 ());
+      now := !now +. half_ns;
+      add ~sck:cpol ~mosi:0 ~cs:1 ();
+      now := !now +. gap_ns);
+    { ns_per_cycle
+    ; events = Array.of_list (List.rev !events)
+    ; next = 0
+    ; now = 0.
+    ; sck = cpol
+    ; mosi = 0
+    ; cs = 1
+    ; bits = 0
+    ; current = []
+    ; received = []
+    ; errors = []
+    }
+  ;;
+
+  (* [miso] is what the target drives this cycle ([None] if it lets go); returns the levels
+     on SCK, MOSI and CS for this cycle *)
+  let step t ~miso =
+    while t.next < Array.length t.events && Float.(t.events.(t.next).at <= t.now) do
+      let e = t.events.(t.next) in
+      t.next <- t.next + 1;
+      if e.sample
+      then (
+        let b =
+          match miso with
+          | Some b -> b
+          | None ->
+            t.errors <- sprintf "%.0f ns: MISO not driven" t.now :: t.errors;
+            0
+        in
+        t.bits <- (t.bits lsl 1) lor b;
+        if e.ends_byte
+        then (
+          t.current <- (t.bits land 0xFF) :: t.current;
+          t.bits <- 0));
+      if e.cs = 1 && t.cs = 0
+      then (
+        t.received <- List.rev t.current :: t.received;
+        t.current <- []);
+      t.sck <- e.sck;
+      t.mosi <- e.mosi;
+      t.cs <- e.cs
+    done;
+    t.now <- t.now +. t.ns_per_cycle;
+    t.sck, t.mosi, t.cs
+  ;;
+
+  let finished t = t.next >= Array.length t.events
+end

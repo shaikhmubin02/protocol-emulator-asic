@@ -15,9 +15,9 @@ address map and the firmware list is in [docs/info.md](docs/info.md).
 Firmware in `hw/firmware`, each one tested against a model of the device on the other end:
 
 - UART, 8N1 full duplex, any baud rate (tested at 9600 and 115200)
-- SPI controller, all four modes
-- I2C controller at 100 and 400 kHz with clock stretching, checked against the timing table in
-  the I2C spec
+- SPI controller and SPI target, all four modes
+- I2C controller and I2C target at 100 and 400 kHz with clock stretching, checked against the
+  timing table in the I2C spec
 - WS2812 LED chains
 - 1-Wire, including reading a device's ROM ID
 - USB low speed: sending and receiving packets, with the line coding, clock recovery and CRC-16
