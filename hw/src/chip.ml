@@ -46,7 +46,7 @@ type mode =
 let n_engines = 4
 
 (* engines 0 and 1 are full; the others are lite: no LUT fabric, no CRC unit *)
-let n_full = 2
+let n_full = 4
 let lite e = e >= n_full
 let n_pins = 15
 let chip_id = 0x5045
