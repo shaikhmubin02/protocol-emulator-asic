@@ -860,3 +860,235 @@ module Usb_ls_transmitter = struct
   ;;
 end
 
+
+(* ---------------- 10BASE-T (802.3 clause 14) ---------------- *)
+
+(* The Ethernet CRC-32 the usual (reflected) way; the FCS is its value, low byte first. *)
+let crc32_eth bytes =
+  List.fold bytes ~init:0xFFFF_FFFF ~f:(fun c b ->
+    let c = ref (c lxor b) in
+    for _ = 1 to 8 do
+      c := if !c land 1 = 1 then (!c lsr 1) lxor 0xEDB8_8320 else !c lsr 1
+    done;
+    !c)
+  lxor 0xFFFF_FFFF
+;;
+
+let with_fcs data =
+  let c = crc32_eth data in
+  data @ List.init 4 ~f:(fun k -> (c lsr (8 * k)) land 0xFF)
+;;
+
+(* The host's side of eth_tx.s: the frame as code to put at label `frame`. *)
+let eth_frame_code data =
+  let rec go = function
+    | [] -> []
+    | [ b ] -> [ "wait event tx_empty"; "csrw txcfg, r5"; sprintf "ldi r0, %d" b; "tx r0" ]
+    | a :: b :: rest -> sprintf "ldi r0, %d" a :: sprintf "ldih r0, %d" b :: "tx r0" :: go rest
+  in
+  String.concat ~sep:"\n" (go data @ [ "ret"; "" ])
+;;
+
+(* Watches a TD line (one level per chip cycle) the way a link partner would: link pulses, and
+   frames decoded from the Manchester code with every zero crossing checked against the 50 ns
+   grid of the first one. A frame has to start with the preamble and SFD, carry whole bytes
+   and a right FCS, and end with TP_IDL: high for 250-350 ns from the last rising edge (TP_IDL
+   starts with the last positive transition), then idle. *)
+module Ten_base_t_receiver = struct
+  type frame =
+    { data : int list (* without the FCS *)
+    ; fcs_ok : bool
+    ; tp_idl_ns : float
+    ; ended : float (* when TP_IDL started *)
+    }
+
+  type t =
+    { ns_per_cycle : float
+    ; mutable now : float
+    ; mutable level : int
+    ; mutable edges : (float * int) list (* this burst, newest first *)
+    ; mutable frames : frame list (* newest first *)
+    ; mutable link_pulses : (float * float) list (* start, width; newest first *)
+    ; mutable errors : string list
+    ; mutable worst_grid_ns : float
+    }
+
+  let create ~ns_per_cycle =
+    { ns_per_cycle
+    ; now = 0.
+    ; level = 0
+    ; edges = []
+    ; frames = []
+    ; link_pulses = []
+    ; errors = []
+    ; worst_grid_ns = 0.
+    }
+  ;;
+
+  let error t s = t.errors <- sprintf "%.0f ns: %s" t.now s :: t.errors
+
+  let decode t edges =
+    let first, _ = List.hd_exn edges in
+    let near time = List.find edges ~f:(fun (at, _) -> Float.(abs (at -. time) <= 25.)) in
+    let rec bits k acc =
+      match near (first +. (100. *. Float.of_int k)) with
+      | Some (_, l) -> bits (k + 1) (l :: acc)
+      | None -> List.rev acc
+    in
+    let bits = bits 0 [] in
+    let n = List.length bits in
+    let fall, _ = List.last_exn edges in
+    let rise = List.filter edges ~f:(fun (_, l) -> l = 1) |> List.last_exn |> fst in
+    (* every crossing but the end of TP_IDL sits on the half-bit grid *)
+    List.iter (List.drop_last_exn edges) ~f:(fun (at, _) ->
+      let half = (at -. first) /. 50. in
+      let off = Float.abs (half -. Float.round_nearest half) *. 50. in
+      t.worst_grid_ns <- Float.max t.worst_grid_ns off;
+      if Float.(off > 20.) then error t (sprintf "crossing %.0f ns off the grid" off));
+    let tp_idl = fall -. rise in
+    if Float.(tp_idl < 250. || tp_idl > 350.) then error t (sprintf "TP_IDL %.0f ns" tp_idl);
+    let preamble = Pemu.Bitstream.(lsb_first_bits eth_preamble) in
+    if n < 64 || not ([%equal: int list] (List.take bits 64) preamble)
+    then error t "no preamble and SFD"
+    else if (n - 64) mod 8 <> 0
+    then error t (sprintf "%d bits after the SFD" (n - 64))
+    else (
+      let bytes =
+        List.chunks_of (List.drop bits 64) ~length:8
+        |> List.map ~f:(List.foldi ~init:0 ~f:(fun k acc b -> acc lor (b lsl k)))
+      in
+      if List.length bytes < 5
+      then error t "frame too short"
+      else (
+        let data = List.take bytes (List.length bytes - 4) in
+        let fcs_ok = [%equal: int list] (with_fcs data) bytes in
+        if not fcs_ok then error t "FCS wrong";
+        t.frames
+        <- { data; fcs_ok; tp_idl_ns = tp_idl; ended = first +. (100. *. Float.of_int n) -. 50. }
+           :: t.frames))
+  ;;
+
+  (* a burst ends after 1 us of idle *)
+  let finish_burst t =
+    let edges = List.rev t.edges in
+    t.edges <- [];
+    match edges with
+    | [ (r, 1); (f, 0) ] when Float.(f -. r < 300.) ->
+      let width = f -. r in
+      if Float.(width < 80. || width > 200.) then error t (sprintf "link pulse %.0f ns" width);
+      t.link_pulses <- (r, width) :: t.link_pulses
+    | (_, 1) :: _ -> decode t edges
+    | _ -> error t "burst doesn't start with a rising edge"
+  ;;
+
+  let step t level =
+    if level <> t.level
+    then (
+      t.edges <- (t.now, level) :: t.edges;
+      t.level <- level)
+    else if level = 0
+    then (
+      match t.edges with
+      | (last, _) :: _ when Float.(t.now -. last > 1000.) -> finish_burst t
+      | _ -> ());
+    t.now <- t.now +. t.ns_per_cycle
+  ;;
+end
+
+(* A 10BASE-T transmitter to drive the chip's receiver: frames (the bytes after the SFD, FCS
+   included) with preamble, SFD and TP_IDL, and a link pulse in each gap, at [bit_ns], with every
+   zero crossing moved by a random amount in +-[jitter_ns] (802.3 asks a receiver to take
+   13.5 ns). The chip samples it once a cycle, starting at [phase_ns]. *)
+module Ten_base_t_transmitter = struct
+  type t =
+    { ns_per_cycle : float
+    ; mutable now : float
+    ; edges : (float * int) array
+    ; mutable next : int
+    ; mutable level : int
+    }
+
+  let create ~ns_per_cycle ~bit_ns ~jitter_ns ~phase_ns ~seed frames =
+    let rng = Random.State.make [| seed |] in
+    let jitter () =
+      if Float.(jitter_ns > 0.) then Random.State.float_range rng (-.jitter_ns) jitter_ns else 0.
+    in
+    let edges = ref []
+    and level = ref 0 in
+    let go time l =
+      if l <> !level
+      then (
+        edges := (time +. jitter (), l) :: !edges;
+        level := l)
+    in
+    let start = ref 2000. in
+    List.iter frames ~f:(fun bytes ->
+      let bits = Pemu.Bitstream.lsb_first_bits (Pemu.Bitstream.eth_preamble @ bytes) in
+      List.iteri bits ~f:(fun k b ->
+        let at = !start +. (bit_ns *. Float.of_int k) in
+        go at (1 - b);
+        go (at +. (bit_ns /. 2.)) b);
+      let fin = !start +. (bit_ns *. Float.of_int (List.length bits)) in
+      (* TP_IDL: 300 ns high from the last rising edge *)
+      let fall = if !level = 1 then fin +. 250. else fin +. 300. in
+      go fin 1;
+      go fall 0;
+      (* a link pulse in the gap, then the next frame *)
+      go (fall +. 3000.) 1;
+      go (fall +. 3100.) 0;
+      start := fall +. 9600.);
+    { ns_per_cycle
+    ; now = phase_ns
+    ; edges = Array.of_list (List.rev !edges)
+    ; next = 0
+    ; level = 0
+    }
+  ;;
+
+  let step t =
+    while t.next < Array.length t.edges && Float.(fst t.edges.(t.next) <= t.now) do
+      t.level <- snd t.edges.(t.next);
+      t.next <- t.next + 1
+    done;
+    t.now <- t.now +. t.ns_per_cycle;
+    t.level
+  ;;
+
+  let finished t = t.next >= Array.length t.edges
+end
+
+(* Reads eth_rx.s's nibble bus on uo[6:1]: RXD = uo[4:1], DV = uo[5], strobe = uo[6]. *)
+module Nibble_bus = struct
+  type t =
+    { mutable strobe : int
+    ; mutable dv : int
+    ; mutable nibbles : int list (* this frame, newest first *)
+    ; mutable frames : int list list (* newest first *)
+    ; mutable errors : string list
+    }
+
+  let create () = { strobe = 0; dv = 0; nibbles = []; frames = []; errors = [] }
+
+  let step t uo =
+    let strobe = bit uo 6
+    and dv = bit uo 5 in
+    if strobe = 1 && t.strobe = 0
+    then
+      if dv = 1
+      then t.nibbles <- ((uo lsr 1) land 0xF) :: t.nibbles
+      else t.errors <- "strobe without DV" :: t.errors;
+    if dv = 0 && t.dv = 1
+    then (
+      let rec bytes = function
+        | lo :: hi :: rest -> (lo lor (hi lsl 4)) :: bytes rest
+        | [] -> []
+        | [ _ ] ->
+          t.errors <- "odd number of nibbles" :: t.errors;
+          []
+      in
+      t.frames <- bytes (List.rev t.nibbles) :: t.frames;
+      t.nibbles <- []);
+    t.strobe <- strobe;
+    t.dv <- dv
+  ;;
+end

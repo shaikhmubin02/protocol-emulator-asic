@@ -66,3 +66,64 @@ let%expect_test "a corrupted bitstream is caught" =
      (model (((name crc) (value 0000000000100000)) ((name din) (value 0)))))
     |}]
 ;;
+
+(* The 10BASE-T bitstreams, on the chip's 8 elements: every next state and every role output
+   for all 256 states and all inputs, against the decoder written out as plain logic. *)
+let prove_all ~words ~ext ~q ~spec =
+  let cfgs = Array.map words ~f:(fun w -> G.of_int_trunc ~width:Pemu.Fabric_logic.cfg_bits w) in
+  let f, out = L.step ~cfgs ~q ~ext in
+  let ok =
+    List.map (spec ~f ~out) ~f:(fun (impl, want) -> G.(impl ==: want)) |> List.reduce_exn ~f:G.( &: )
+  in
+  match Hardcaml_verify.Solver.(solve ~solver:minisat) (G.cnf G.(~:ok)) with
+  | Ok Unsat -> print_endline "proved: bitstream = spec for all states and inputs"
+  | Ok (Sat model) ->
+    print_s [%message "counterexample" (model : Hardcaml_verify.Cnf.Model_with_vectors.input list)]
+  | Error e -> print_s [%message "solver error" (e : Error.t)]
+;;
+
+let%expect_test "10BASE-T TX bitstream: Manchester" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and d = G.input "d" 1 in
+  prove_all
+    ~words:(Pemu.Bitstream.eth_tx ~n_le:8)
+    ~ext:G.(gnd @: gnd @: d)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let first = q.(0) in
+      (* element 0 toggles; line = complement first, then the bit; hold in the first half;
+         the unused elements stay 0 *)
+      [ f.(0), G.( ~: ) first; out.(1), G.(d ^: first); out.(0), first ]
+      @ List.init 6 ~f:(fun k -> f.(k + 2), G.gnd));
+  [%expect {| proved: bitstream = spec for all states and inputs |}]
+;;
+
+let%expect_test "10BASE-T RX bitstream: edge decoder" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and s = G.input "sample" 1 in
+  prove_all
+    ~words:(Pemu.Bitstream.eth_rx ~n_le:8)
+    ~ext:G.(gnd @: s @: gnd)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let open G in
+      let p = q.(1)
+      and t1 = q.(2)
+      and t2 = q.(3)
+      and t3 = q.(4)
+      and u = q.(5)
+      and seen = q.(7) in
+      let e = s ^: p in
+      let take = e &: (t3 |: u) in
+      [ f.(1), s
+      ; f.(2), ~:e
+      ; f.(3), t1 &: ~:e
+      ; f.(4), t2 &: ~:e
+      ; f.(5), mux2 e ~:(t3 |: u) u
+      ; f.(7), seen |: (e &: u)
+      ; out.(1), s (* rx bit *)
+      ; out.(6), ~:(take &: seen) (* drop *)
+      ; out.(7), seen (* flag *)
+      ]);
+  [%expect {| proved: bitstream = spec for all states and inputs |}]
+;;

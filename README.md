@@ -22,9 +22,12 @@ Firmware in `hw/firmware`, each one tested against a model of the device on the 
 - 1-Wire, including reading a device's ROM ID
 - USB low speed: sending and receiving packets, with the line coding, clock recovery and CRC-16
   done on the chip (tested at the 1.5% clock error the spec allows)
+- 10BASE-T: sending frames (Manchester, FCS, TP_IDL and link pulses on the chip) and receiving
+  them onto a 4-bit bus with the FCS checked. RX jitter tolerance is below what 802.3 asks for at
+  50 MHz; the datasheet has the numbers
 
-10BASE-T is next. Engines 0 and 1 also have a small LUT fabric and a CRC unit for bit-level
-coding.
+Engines 0 and 1 also have a small LUT fabric and a CRC unit for bit-level coding; USB and
+10BASE-T use them.
 
 ## How it's checked
 

@@ -273,3 +273,57 @@ let%expect_test "usb_rx.s in lockstep, fed 1.5% slow" =
   printf "%d cycles in lockstep, %d words received\n" ls.cycle !got;
   [%expect {| 8000 cycles in lockstep, 10 words received |}]
 ;;
+
+let%expect_test "eth_tx.s in lockstep, checked by the 802.3 receiver" =
+  let data = List.init 60 ~f:(fun k -> (k * 37) land 0xFF) in
+  let program =
+    match Asm.assemble (In_channel.read_all "../firmware/eth_tx.s" ^ Devices.eth_frame_code data) with
+    | Ok w -> w
+    | Error e -> failwith e
+  in
+  let ls =
+    Lockstep.create ~fabric:(Bitstream.eth_tx ~n_le:Model.n_le) ~crc_poly:Bitstream.eth_poly
+      ~crc_init:Bitstream.eth_tx_crc_init program
+  in
+  let rx = Devices.Ten_base_t_receiver.create ~ns_per_cycle:20. in
+  for cycle = 1 to 5_000 do
+    let send = if cycle = 100 then Some 1 else None in
+    ignore (Lockstep.step ?send ls Model.Pads.zero : int option * bool);
+    Devices.Ten_base_t_receiver.step rx (Lockstep.uo ls land 1)
+  done;
+  let ok =
+    List.is_empty rx.errors
+    && List.exists rx.frames ~f:(fun f -> f.fcs_ok && [%equal: int list] f.data data)
+  in
+  printf "%d cycles in lockstep, frame %s\n" ls.cycle (if ok then "ok" else "WRONG");
+  [%expect {| 5000 cycles in lockstep, frame ok |}]
+;;
+
+let%expect_test "eth_rx.s in lockstep, fed 100 ppm fast" =
+  let program =
+    match Asm.assemble (In_channel.read_all "../firmware/eth_rx.s") with
+    | Ok w -> w
+    | Error e -> failwith e
+  in
+  let ls =
+    Lockstep.create ~fabric:(Bitstream.eth_rx ~n_le:Model.n_le) ~crc_poly:Bitstream.eth_poly
+      ~crc_init:0xFFFF_FFFF program
+  in
+  let frames = [ Devices.with_fcs (List.init 60 ~f:(fun k -> (k * 91) land 0xFF)) ] in
+  let far =
+    Devices.Ten_base_t_transmitter.create ~ns_per_cycle:20. ~bit_ns:99.99 ~jitter_ns:3.
+      ~phase_ns:5. ~seed:1 frames
+  in
+  let bus = Devices.Nibble_bus.create () in
+  let status = ref [] in
+  for _ = 1 to 6_000 do
+    let level = Devices.Ten_base_t_transmitter.step far in
+    let read, _ = Lockstep.step ~receive:true ls { Model.Pads.zero with ui_in = level lsl 3 } in
+    Option.iter read ~f:(fun w -> status := w :: !status);
+    Devices.Nibble_bus.step bus (Lockstep.uo ls)
+  done;
+  let ok = [%equal: int list list] (List.rev bus.frames) frames in
+  printf "%d cycles in lockstep, frame %s, status %s\n" ls.cycle (if ok then "ok" else "WRONG")
+    (String.concat ~sep:" " (List.map !status ~f:(sprintf "0x%04x")));
+  [%expect {| 6000 cycles in lockstep, frame ok, status 0x8040 |}]
+;;

@@ -88,3 +88,72 @@ let usb_tx ~n_le =
        if sent = 1 then prev else 1 - prev);
   w
 ;;
+
+(* 10BASE-T TX line coding: Manchester, on TX ticks at twice the bit rate. Element 0 toggles
+   every tick and is 1 in the first half of a bit; it is also the hold role, so the shifter keeps
+   each bit for two ticks. Element 1 = line: the complement of the bit in the first half, the bit
+   in the second (802.3: a 1 goes low to high in the middle). Roles: line = 1, hold = 0. *)
+let eth_tx ~n_le =
+  let w = Array.create ~len:n_le empty in
+  w.(0) <- word ~use_ff:true ~init:1 ~inputs:[ Self ] (fun first _ _ _ -> 1 - first);
+  w.(1) <- word ~inputs:[ Ext0; Le0 ] (fun d first _ _ -> d lxor first);
+  w
+;;
+
+(* 10BASE-T RX Manchester decoder, on RX ticks with one tick per cycle (all elements RX-clocked).
+     0 e      an edge: the sample differs from the last one (combinational)
+     1 P      the last sample; its LUT output is the sample itself = the rx bit role
+     2..4     t1 t2 t3: a thermometer cleared on every edge, so t3 = "4 or more cycles since the
+              last edge"
+     5 U      the last edge was not taken (it was a bit boundary)
+     6 D      drop role: keep a bit only on a taken edge after the SFD
+     7 S      the SFD has been seen (sticky until BEN 1); also the flag role
+   An edge is taken (a mid-bit edge) if t3 or U: a boundary edge comes about 2.5 cycles after a
+   mid-bit edge, and a mid-bit edge always follows a boundary edge. The preamble has only mid-bit
+   edges, so the first edge taken through U is the second 1 of the SFD; S goes up there, and the
+   first bit kept is the first bit of the frame. *)
+let eth_rx ~n_le =
+  let w = Array.create ~len:n_le empty in
+  let on_rx = true in
+  w.(0) <- word ~on_rx ~inputs:[ Ext1; Next ] (fun s p _ _ -> s lxor p);
+  w.(1) <- word ~on_rx ~inputs:[ Ext1 ] (fun s _ _ _ -> s);
+  w.(2) <- word ~on_rx ~init:1 ~inputs:[ Le0 ] (fun e _ _ _ -> 1 - e);
+  w.(3) <- word ~on_rx ~init:1 ~inputs:[ Le0; Prev ] (fun e t _ _ -> t land (1 - e));
+  w.(4) <- word ~on_rx ~init:1 ~inputs:[ Le0; Prev ] (fun e t _ _ -> t land (1 - e));
+  w.(5)
+  <- word ~on_rx ~inputs:[ Le0; Prev; Self ] (fun e t3 u _ ->
+       if e = 1 then (1 - t3) land (1 - u) else u);
+  w.(6)
+  <- word ~on_rx ~inputs:[ Le0; Prev2; Prev; Next ] (fun e t3 u s ->
+       1 - (e land (t3 lor u) land s));
+  w.(7)
+  <- word ~on_rx ~use_ff:true ~inputs:[ Self; Le0; Prev2 ] (fun s e u _ -> s lor (e land u));
+  w
+;;
+
+(* Ethernet CRC-32 as the CRC unit computes it (shift left, poly 0x04C11DB7), one bit at a time
+   in the order the bits are sent, and the step run backwards. *)
+let eth_poly = 0x04C11DB7
+
+let crc32_step c b =
+  let fb = ((c lsr 31) land 1) lxor b in
+  ((c lsl 1) land 0xFFFF_FFFF) lxor if fb = 1 then eth_poly else 0
+;;
+
+let crc32_unstep c b =
+  let fb = c land 1 in
+  let shifted = c lxor if fb = 1 then eth_poly else 0 in
+  (shifted lsr 1) lor ((fb lxor b) lsl 31)
+;;
+
+let lsb_first_bits bytes =
+  List.concat_map bytes ~f:(fun x -> List.init 8 ~f:(fun k -> (x lsr k) land 1))
+;;
+
+let eth_preamble = List.init 7 ~f:(fun _ -> 0x55) @ [ 0xD5 ]
+
+(* eth_tx.s feeds the preamble and SFD through the CRC too, so the CRC init value is the one
+   that leaves all ones after them. *)
+let eth_tx_crc_init =
+  List.fold (List.rev (lsb_first_bits eth_preamble)) ~init:0xFFFF_FFFF ~f:crc32_unstep
+;;
