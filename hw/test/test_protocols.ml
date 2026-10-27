@@ -163,7 +163,7 @@ let%expect_test "i2c_master.s against an EEPROM that stretches the clock" =
   let prog, replies, dev, _ = i2c_eeprom_run ~stretch:23 () in
   printf "%d words; replies %s; %d STARTs, %d stretched ACKs\n" (Array.length prog)
     (Sexp.to_string [%sexp (replies : int list)]) dev.starts dev.stretches;
-  [%expect {| 120 words; replies (0 0 0 0 0 0 0 90 195 1); 4 STARTs, 7 stretched ACKs |}]
+  [%expect {| 124 words; replies (0 0 0 0 0 0 0 90 195 1); 4 STARTs, 7 stretched ACKs |}]
 ;;
 
 (* At a 50 MHz clock (20 ns a cycle), with the target holding SCL low for longer than the master
@@ -180,9 +180,9 @@ let%expect_test "i2c_master.s meets the spec timing at 100 and 400 kHz" =
       name q khz dev.stretches (timing.longest_low * 20) (String.concat ~sep:", " mins));
   [%expect {|
     standard (Q = 100): SCL 98 kHz, 7 stretched ACKs, longest SCL low 8020 ns
-      shortest (ns): tLOW 5980, tHIGH 4120, tSU;STA 6100, tHD;STA 6000, tSU;STO 4120, tBUF 14140, tSU;DAT 3980
+      shortest (ns): tLOW 5980, tHIGH 4120, tSU;STA 6100, tHD;STA 6000, tSU;STO 4120, tBUF 18140, tSU;DAT 3980
     fast (Q = 25): SCL 381 kHz, 7 stretched ACKs, longest SCL low 2020 ns
-      shortest (ns): tLOW 1480, tHIGH 1120, tSU;STA 1600, tHD;STA 1500, tSU;STO 1120, tBUF 3640, tSU;DAT 980
+      shortest (ns): tLOW 1480, tHIGH 1120, tSU;STA 1600, tHD;STA 1500, tSU;STO 1120, tBUF 4640, tSU;DAT 980
     |}]
 ;;
 

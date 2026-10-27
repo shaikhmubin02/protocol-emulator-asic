@@ -229,6 +229,6 @@ let%expect_test "SPI, I2C and UART running at the same time" =
     SPI  12 bytes each way in one CS-low transfer: ok
     I2C  replies 0000 0000 0000 0000 0000 0000 0000 005a 00c3, EEPROM 0x10-11 = 5a c3, 384 kHz, 7 stretched ACKs
     UART 12 bytes echoed: ok
-    all three mid-transfer in 6 of 28 busy 1000-cycle windows
+    all three mid-transfer in 9 of 28 busy 1000-cycle windows
     |}]
 ;;

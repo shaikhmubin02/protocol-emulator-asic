@@ -70,9 +70,14 @@ c_speed:
       jmp  loop
 
 ; START: release SDA, then SCL. After 3 Q with both high, pull SDA low, hold 3 Q, SCL low.
-; On a repeated START SCL is still low from the last bit.
+; On a repeated START SCL is still low from the last bit, and has to stay low for 3 Q like any
+; other low time.
 start:
       pin  p1, hiz
+      add  r7, r4
+      wait time r7
+      add  r7, r4
+      wait time r7
       add  r7, r4
       wait time r7
       call scl_high        ; 2 Q
