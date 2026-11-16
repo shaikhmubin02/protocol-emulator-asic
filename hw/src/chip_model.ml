@@ -27,6 +27,7 @@ type engine =
   ; mutable has : bool
   ; mutable head : int (* the outbox's two registers: the head stays put when it empties *)
   ; mutable second : int
+  ; mutable bp_cfg : int (* debug: [7:0] breakpoint pc, [8] on, [9] join *)
   }
 
 type t =
@@ -64,6 +65,7 @@ let create () =
         ; has = false
         ; head = 0
         ; second = 0
+        ; bp_cfg = 0
         })
   ; time = 0
   ; flags = 0
@@ -134,6 +136,12 @@ let read_value t =
       | 0x11 -> t.flags
       | 0x12 -> t.time land 0xffff
       | 0x13 -> t.time lsr 16
+      | 0x14 ->
+        let each f =
+          Array.foldi t.engines ~init:0 ~f:(fun e acc en ->
+            acc lor (b2i (Option.value_map en.model ~default:false ~f) lsl e))
+        in
+        each Model.stopped lor (each (fun m -> m.dbg.by_bp) lsl 4)
       | 0x20 -> chip_id
       | _ -> 0)
   else (
@@ -155,7 +163,15 @@ let read_value t =
          lor (b2i (bit t.run engine) lsl 9)
          lor (Queue.length m.to_engine lsl 10)
          lor (Queue.length m.from_engine lsl 12)
-         lor (b2i m.be.enabled lsl 14))
+         lor (b2i m.be.enabled lsl 14)
+         lor (b2i m.dbg.stopped lsl 15))
+    | 2 when off = 1 ->
+      en.bp_cfg
+      lor Option.value_map m ~default:0 ~f:(fun m ->
+        (b2i m.dbg.stopped lsl 10) lor (b2i m.dbg.by_bp lsl 11))
+    | 2 when off = 2 ->
+      Option.value_map m ~default:0 ~f:(fun m ->
+        b2i m.z lor (b2i m.c lsl 1) lor (b2i m.tflag lsl 2) lor (m.sp lsl 3) lor (m.busy lsl 8))
     | 2 when off lsr 3 = 2 -> Option.value_map m ~default:0 ~f:(fun m -> m.regs.(off land 7))
     | _ -> 0)
 ;;
@@ -186,6 +202,32 @@ let step t (pads : Model.Pads.t) =
   let set = ref 0
   and clr = ref 0 in
   let flags_now = t.flags in
+  (* debug: every running engine's model, with this cycle's breakpoint setting and host command,
+     so that each engine can see whether another one's breakpoint fires this cycle *)
+  let models =
+    Array.mapi t.engines ~f:(fun e en ->
+      if not (bit t.run e)
+      then None
+      else (
+        let m = Option.value_or_thunk en.model ~default:(fun () -> fresh_model en) in
+        Model.set_breakpoint m ~pc:en.bp_cfg ~on:(bit en.bp_cfg 8) ~join:(bit en.bp_cfg 9);
+        Some m))
+  in
+  let debug =
+    Array.init n_engines ~f:(fun e ->
+      let w_this = t.wr && w_engine = e && w_region = 2 in
+      let cmd k = w_global 0x14 && bit t.wr_data ((4 * k) + e) in
+      { Model.Debug_cmd.stop = cmd 0
+      ; resume = cmd 1
+      ; step = cmd 2
+      ; write_reg = Option.some_if (w_this && w_off lsr 3 = 2) (w_off land 7, t.wr_data)
+      ; write_pc = Option.some_if (w_this && w_off = 0) t.wr_data
+      })
+  in
+  let triggers =
+    Array.mapi models ~f:(fun e m ->
+      Option.value_map m ~default:false ~f:(Model.bp_trigger ~debug:debug.(e)))
+  in
   Array.iteri t.engines ~f:(fun e en ->
     let w_this = t.wr && w_engine = e in
     let host_wr = w_this && w_region = 2 && bit w_off 7 && en.room in
@@ -207,17 +249,14 @@ let step t (pads : Model.Pads.t) =
       en.head <- 0;
       en.second <- 0)
     else (
-      let m =
-        match en.model with
-        | Some m -> m
-        | None -> fresh_model en
-      in
+      let m = Option.value_exn models.(e) in
       m.time <- t.time;
       Array.iteri m.flags ~f:(fun k _ -> m.flags.(k) <- bit flags_now k);
       for q = 0 to n_pins - 1 do
         m.owned.(q) <- [%equal: int option] (owner_of t q) (Some e)
       done;
-      Model.step m pads;
+      let others_hit = Array.existsi triggers ~f:(fun k hit -> k <> e && hit) in
+      Model.step m ~debug:debug.(e) ~others_hit pads;
       en.sram_addr <- m.pc;
       set := !set lor m.flag_set;
       clr := !clr lor m.flag_clr;
@@ -249,6 +288,7 @@ let step t (pads : Model.Pads.t) =
   t.time <- (t.time + 1) land 0xffff_ffff;
   if t.wr && w_region = 1 && not (bit w_off 0) then t.lo_half <- t.wr_data;
   if w_global 0x10 then t.run <- t.wr_data land 0xf;
+  if t.wr && w_region = 2 && w_off = 1 then t.engines.(w_engine).bp_cfg <- t.wr_data land 0x3ff;
   for q = 0 to n_pins - 1 do
     if w_global q then t.owners.(q) <- t.wr_data land 7
   done;

@@ -68,6 +68,30 @@ type pending =
   ; mutable p_csr : (int * int) list
   }
 
+(* Debug state (ADR 0013). A debug stop freezes only the sequencer; [skip] keeps a breakpoint on
+   the current pc from firing again until the pc has moved. *)
+type debug =
+  { mutable bp : int
+  ; mutable bp_on : bool
+  ; mutable join : bool (* also stop when another engine hits its breakpoint *)
+  ; mutable stopped : bool
+  ; mutable by_bp : bool
+  ; mutable skip : bool
+  }
+
+(* What the host does to one engine's debug logic in a cycle. *)
+module Debug_cmd = struct
+  type t =
+    { stop : bool
+    ; resume : bool
+    ; step : bool (* run the sequencer for this one cycle *)
+    ; write_reg : (int * int) option (* register, value: only while stopped *)
+    ; write_pc : int option (* only while stopped; also clears busy and halted *)
+    }
+
+  let none = { stop = false; resume = false; step = false; write_reg = None; write_pc = None }
+end
+
 type t =
   { program : int array
   ; lite : bool (* no LUT fabric, no CRC unit (Isa.Csr.writable_lite) *)
@@ -101,6 +125,7 @@ type t =
   ; mailbox_depth : int
   ; be : bit_engine
   ; pend : pending
+  ; dbg : debug
   }
 
 let mask16 = 0xffff
@@ -164,6 +189,7 @@ let create ?(lite = false) ?(mailbox_depth = 2) program =
       ; flag_latch = false
       }
   ; pend = { p_tx = None; p_rx_take = false; p_crci = false; p_ben = None; p_csr = [] }
+  ; dbg = { bp = 0; bp_on = false; join = false; stopped = false; by_bp = false; skip = false }
   }
 ;;
 
@@ -729,7 +755,29 @@ let input_events t ~capcfg ~rx ~baud ~period ~enabled =
     then align ())
 ;;
 
-let step t (pads : Pads.t) =
+(* The breakpoint fires when the engine is about to issue the instruction at [bp]. *)
+let bp_hit t =
+  let d = t.dbg in
+  d.bp_on && d.bp = t.pc && (not t.halted) && t.busy = 0 && not d.skip
+;;
+
+(* This engine's breakpoint hit as the other engines see it (not while it is being stepped). *)
+let bp_trigger ?(debug = Debug_cmd.none) t = bp_hit t && not debug.step
+
+let set_breakpoint t ~pc ~on ~join =
+  t.dbg.bp <- pc land 0xff;
+  t.dbg.bp_on <- on;
+  t.dbg.join <- join
+;;
+
+(* [others_hit]: some other engine's breakpoint fired this cycle. *)
+let step ?(debug = Debug_cmd.none) ?(others_hit = false) t (pads : Pads.t) =
+  let d = t.dbg in
+  let hit = bp_hit t in
+  let any_hit = bp_trigger ~debug t || others_hit in
+  let stop_now = (not debug.step) && (d.stopped || hit || (d.join && any_hit)) in
+  let was_stopped = d.stopped
+  and pc_before = t.pc in
   t.be.completed <- false;
   t.flag_set <- 0;
   t.flag_clr <- 0;
@@ -738,7 +786,7 @@ let step t (pads : Pads.t) =
   and baud = t.csr.(Isa.Csr.baud)
   and period_now = period t
   and enabled = t.be.enabled in
-  if not t.halted
+  if not (t.halted || stop_now)
   then
     if t.busy > 0
     then (
@@ -750,7 +798,24 @@ let step t (pads : Pads.t) =
   apply_pending t;
   t.time <- (t.time + 1) land mask32;
   t.sync2 <- t.sync1;
-  t.sync1 <- Pads.to_vector pads
+  t.sync1 <- Pads.to_vector pads;
+  if debug.resume
+  then (
+    d.stopped <- false;
+    d.by_bp <- false;
+    d.skip <- true)
+  else (
+    let newly = (not was_stopped) && (not debug.step) && (hit || (d.join && any_hit)) in
+    if newly then d.by_bp <- true;
+    if newly || debug.stop then d.stopped <- true;
+    if debug.step then d.skip <- true else if t.pc <> pc_before then d.skip <- false);
+  if was_stopped
+  then (
+    Option.iter debug.write_reg ~f:(fun (k, v) -> t.regs.(k) <- v land mask16);
+    Option.iter debug.write_pc ~f:(fun v ->
+      t.pc <- v land 0xff;
+      t.busy <- 0;
+      t.halted <- false))
 ;;
 
 (* ---- host side / inspection ---- *)
@@ -767,5 +832,6 @@ let host_receive t = Queue.dequeue t.from_engine
 let pc t = t.pc
 let reg t i = t.regs.(i)
 let halted t = t.halted
+let stopped t = t.dbg.stopped
 let time t = t.time
 let crc t = t.be.crc

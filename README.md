@@ -29,6 +29,10 @@ Firmware in `hw/firmware`, each one tested against a model of the device on the 
 Each engine also has a small LUT fabric and a CRC unit for bit-level coding; USB and 10BASE-T
 use them, and any engine can run them.
 
+Engines can be debugged on the chip over the host port: breakpoints, single cycle steps, and
+reading or changing registers while stopped. A breakpoint on one engine can stop the others in
+the same clock cycle, so the whole chip can be inspected at one moment of a protocol exchange.
+
 ## How it's checked
 
 The design is written in [Hardcaml](https://github.com/janestreet/hardcaml) (`hw/`), which

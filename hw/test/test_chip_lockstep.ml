@@ -100,7 +100,10 @@ let attach ~seed (t : H.t) =
   model
 ;;
 
-let run ?(log = false) ?(config = true) ?(wiggle = true) ~seed ~actions () =
+let debug_actions = ref 0
+let debug_stops = ref 0
+
+let run ?(log = false) ?(config = true) ?(wiggle = true) ?(debug = false) ~seed ~actions () =
   let rng = Random.State.make [| seed |] in
   let rand n = Random.State.int rng n in
   let t = H.create () in
@@ -140,7 +143,27 @@ let run ?(log = false) ?(config = true) ?(wiggle = true) ~seed ~actions () =
       model.run
       (Sexp.to_string [%sexp (Array.map model.engines ~f:(fun en -> en.mem.(0)) : int array)]);
   for _ = 1 to actions do
-    (match rand 12 with
+    (match rand (if debug then 18 else 12) with
+     | 12 ->
+       (* debug (ADR 0013): breakpoint somewhere in the first 48 words, maybe joined *)
+       H.write t (H.engine_addr (engine ()) ~region:2 1) [ rand 48 lor (rand 4 lsl 8) ];
+       incr debug_actions
+     | 13 | 14 ->
+       (* stop / resume / step any engines, all in one cycle *)
+       H.write t (H.global 0x14) [ rand 0x1000 ];
+       incr debug_actions
+     | 15 ->
+       let e = engine () in
+       if rand 2 = 0
+       then H.write t (H.reg e (rand 8)) [ rand 0x10000 ]
+       else H.write t (H.status e) [ rand 48 ];
+       incr debug_actions
+     | 16 ->
+       let d = H.read1 t (H.global 0x14) in
+       debug_stops := !debug_stops + Int.popcount (d land 0xf)
+     | 17 ->
+       let e = engine () in
+       ignore (H.read t (H.engine_addr e ~region:2 1) 2 : int list)
      | 0 -> H.write t H.flags_reg [ rand 256 ]
      | 1 | 2 ->
        let e = engine () in
@@ -199,4 +222,16 @@ let%expect_test "whole chip against the chip model, random programs and host tra
     engine-cycles 1873186, driven pin-cycles 528072, flag changes 117
     host words in 142, out 38, engine stops 54, program reloads 35
     |}]
+;;
+
+let%expect_test "whole chip against the chip model, with random debug traffic" =
+  let seeds = 16 in
+  for seed = 1 to seeds do
+    run ~debug:true ~seed:(100 + seed) ~actions:80 ()
+  done;
+  printf "%d seeds: no differences; debug writes %d, engines seen stopped %d\n"
+    seeds
+    !debug_actions
+    !debug_stops;
+  [%expect {| 16 seeds: no differences; debug writes 305, engines seen stopped 47 |}]
 ;;

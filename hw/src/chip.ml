@@ -82,6 +82,8 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
   and pop_pending = var 1
   and pop_engine = var 2 in
   let owners = Array.init n_pins ~f:(fun _ -> var 3) in
+  (* debug (ADR 0013): per engine [7:0] breakpoint pc, [8] on, [9] join *)
+  let bp_cfg = Array.init n_engines ~f:(fun _ -> var 10) in
   let shifted = shift_in.value.:[14, 0] @: mosi in
   let reading = cmd.value ==:. 0x03 in
   let writing = cmd.value ==:. 0x02 in
@@ -106,6 +108,10 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
   let mailbox_has = Array.init n_engines ~f:(fun _ -> wire 1) in
   let outbox_count = Array.init n_engines ~f:(fun _ -> wire 2) in
   let owner_is q e = bit owners.(q).value 2 &: (owners.(q).value.:[1, 0] ==:. e) in
+  let triggers = Array.init n_engines ~f:(fun _ -> wire 1) in
+  (* region 3 offset 0x14: stop [3:0], resume [7:4], step [11:8], one bit per engine, all in the
+     same cycle *)
+  let dbg_cmd k e = w_global 0x14 &: bit wr_data.value ((4 * k) + e) in
   let engines =
     Array.init n_engines ~f:(fun e ->
       let w_this = wr.value &: (w_engine ==:. e) in
@@ -134,8 +140,22 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
         ; cfg_data = wr_data.value @: lo_half.value
         ; time = time.value
         ; ev_flags = flags.value
+        ; dbg_bp = bp_cfg.(e).value.:[7, 0]
+        ; dbg_bp_on = bit bp_cfg.(e).value 8
+        ; dbg_join = bit bp_cfg.(e).value 9
+        ; dbg_others_hit =
+            List.reduce_exn
+              ~f:( |: )
+              (gnd :: List.filter_mapi (Array.to_list triggers) ~f:(fun k t -> Option.some_if (k <> e) t))
+        ; dbg_stop = dbg_cmd 0 e
+        ; dbg_resume = dbg_cmd 1 e
+        ; dbg_step = dbg_cmd 2 e
+        ; dbg_reg_we = w_this &: (w_region ==:. 2) &: (w_off.:[11, 3] ==:. 2)
+        ; dbg_pc_we = w_this &: (w_region ==:. 2) &: (w_off ==:. 0)
+        ; dbg_idx = w_off.:[2, 0]
         })
   in
+  Array.iteri engines ~f:(fun e (o : _ Engine.O.t) -> assign triggers.(e) o.dbg_trigger);
   Array.iteri engines ~f:(fun e (o : _ Engine.O.t) ->
     assign inbox_count.(e) o.inbox_count;
     assign outbox_count.(e) o.outbox_count;
@@ -144,8 +164,10 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
   let engine_word (o : _ Engine.O.t) e =
     let status =
       concat_lsb
-        [ o.pc; o.halted; bit run.value e; o.inbox_count; o.outbox_count; o.be_enabled; gnd ]
+        [ o.pc; o.halted; bit run.value e; o.inbox_count; o.outbox_count; o.be_enabled; o.dbg_stopped ]
     in
+    let debug = concat_lsb [ bp_cfg.(e).value; o.dbg_stopped; o.dbg_by_bp ] |> uresize ~width:16
+    and state = concat_lsb [ o.flags; o.sp; zero 3; o.busy ] in
     let regs = mux r_off.:[2, 0] o.regs in
     mux
       r_region
@@ -157,7 +179,10 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
           (mux2
              (r_off ==:. 0)
              status
-             (mux2 (r_off.:[11, 3] ==:. 2) regs (zero 16)))
+             (mux2
+                (r_off ==:. 1)
+                debug
+                (mux2 (r_off ==:. 2) state (mux2 (r_off.:[11, 3] ==:. 2) regs (zero 16)))))
       ; zero 16
       ]
   in
@@ -168,6 +193,9 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
         ; 0x11, uresize flags.value ~width:16
         ; 0x12, time.value.:[15, 0]
         ; 0x13, time.value.:[31, 16]
+        ; ( 0x14
+          , let each f = concat_lsb (Array.to_list (Array.map engines ~f)) in
+            uresize (each (fun o -> o.dbg_by_bp) @: each (fun o -> o.dbg_stopped)) ~width:16 )
         ; 0x20, of_int_trunc ~width:16 chip_id
         ]
     in
@@ -196,6 +224,11 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
     ; when_ word_written [ wr_addr <-- addr.value; wr_data <-- shifted ]
     ; when_ (wr.value &: (w_region ==:. 1) &: ~:(bit w_off 0)) [ lo_half <-- wr_data.value ]
     ; when_ (w_global 0x10) [ run <-- wr_data.value.:[n_engines - 1, 0] ]
+    ; proc
+        (List.init n_engines ~f:(fun e ->
+           when_
+             (wr.value &: (w_engine ==:. e) &: (w_region ==:. 2) &: (w_off ==:. 1))
+             [ bp_cfg.(e) <-- wr_data.value.:[9, 0] ]))
     ; proc
         (List.init n_pins ~f:(fun q ->
            when_ (w_global q) [ owners.(q) <-- wr_data.value.:[2, 0] ]))

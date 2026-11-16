@@ -222,6 +222,49 @@ async def test_power_up_state(dut):
     assert not bad, f"after writing the configuration: {bad[:20]}"
 
 
+UART_PULL = 17  # address of `send: pull r0` in uart.s
+
+
+@cocotb.test()
+async def test_debug_breakpoint_join_step(dut):
+    """uart.s on engines 0-2. A breakpoint on engine 1's pull stops engines 0 and 2 too (join);
+    one step takes the host byte into r0, the host replaces it, and after resume the UART sends
+    the replacement."""
+    b = await start(dut)
+    for e in range(3):
+        await b.write(program(e), firmware("uart.hex"))
+    await b.write(glob(8), [0b100 | 1])
+    await b.write(engine_addr(1, 2, 1), [0x100 | UART_PULL])  # breakpoint on
+    for e in (0, 2):
+        await b.write(engine_addr(e, 2, 1), [0x200])  # join only
+    await b.write(glob(0x10), [0b0111])
+    b.loop_tx_to_rx = True
+    await b.wait(200)
+    assert await b.read1(glob(0x14)) == 0, "nothing stopped yet"
+
+    await b.write(mailbox(1), [0x5A])
+    for _ in range(20):
+        if await b.read1(glob(0x14)) & 0b0111 == 0b0111:
+            break
+    dbg = await b.read1(glob(0x14))
+    assert dbg == 0b0111_0111, f"engines 0-2 stopped by the breakpoint, got {dbg:#x}"
+    st = await b.read1(status(1))
+    assert st & 0xFF == UART_PULL and st >> 15, f"engine 1 status {st:#x}"
+    assert (await b.read1(engine_addr(1, 2, 1))) >> 10 == 0b11
+
+    await b.write(glob(0x14), [1 << (8 + 1)])  # one cycle of engine 1: the pull
+    assert await b.read1(status(1)) & 0xFF == UART_PULL + 1
+    assert await b.read1(engine_addr(1, 2, 0x10)) == 0x5A
+    await b.write(engine_addr(1, 2, 0x10), [0x41])  # r0 = 'A'
+
+    await b.write(glob(0x14), [0b0111 << 4])  # resume all three
+    assert await b.read1(glob(0x14)) == 0
+    for _ in range(50):
+        if (await b.read1(status(1)) >> 12) & 3:
+            break
+    assert await b.read1(mailbox(1)) == 0x41, "the UART should send the byte the host put in r0"
+
+
 @cocotb.test()
 async def test_uart_loopback(dut):
     """uart.s on engine 1, TX on uo[0] wired back to RX on ui[3]."""

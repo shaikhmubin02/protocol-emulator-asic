@@ -66,6 +66,8 @@ let compare_state t =
   check "sp" ~rtl:(get o.sp) ~model:m.sp;
   check "busy" ~rtl:(get o.busy) ~model:m.busy;
   check "halted" ~rtl:(get o.halted) ~model:(Bool.to_int m.halted);
+  check "debug stopped" ~rtl:(get o.dbg_stopped) ~model:(Bool.to_int m.dbg.stopped);
+  check "debug by breakpoint" ~rtl:(get o.dbg_by_bp) ~model:(Bool.to_int m.dbg.by_bp);
   check "flags" ~rtl:t.flags ~model:(Model.read_csr m Isa.Csr.flags);
   check "inbox" ~rtl:(get o.inbox_count) ~model:(Queue.length m.to_engine);
   check "outbox" ~rtl:(get o.outbox_count) ~model:(Queue.length m.from_engine);
@@ -81,7 +83,19 @@ let compare_state t =
 (* One cycle. [send] is a word the host wants to write this cycle (written only if the inbox has
    room at the start of the cycle); [receive] says whether the host reads the outbox. Returns the
    word the host read, if any. *)
-let step ?send ?(receive = false) t (pads : Model.Pads.t) =
+let set_breakpoint t ~pc ~on ~join =
+  let set r w v = r := Bits.of_int_trunc ~width:w v in
+  set t.i.dbg_bp 8 pc;
+  set t.i.dbg_bp_on 1 (Bool.to_int on);
+  set t.i.dbg_join 1 (Bool.to_int join);
+  Model.set_breakpoint t.model ~pc ~on ~join
+;;
+
+(* [debug] is what the host does to the debug logic this cycle; [others_hit] stands in for
+   another engine's breakpoint firing. *)
+let step ?send ?(receive = false) ?(debug = Model.Debug_cmd.none) ?(others_hit = false) t
+  (pads : Model.Pads.t)
+  =
   let i = t.i in
   let set r w v = r := Bits.of_int_trunc ~width:w v in
   let inbox_room = get t.o.inbox_count < 2
@@ -95,11 +109,28 @@ let step ?send ?(receive = false) t (pads : Model.Pads.t) =
   set i.host_rd 1 (Bool.to_int reading);
   set i.time 32 (Model.time t.model);
   set i.ev_flags 8 t.flags;
+  let b v = Bool.to_int v in
+  set i.dbg_stop 1 (b debug.stop);
+  set i.dbg_resume 1 (b debug.resume);
+  set i.dbg_step 1 (b debug.step);
+  set i.dbg_others_hit 1 (b others_hit);
+  set i.dbg_reg_we 1 (b (Option.is_some debug.write_reg));
+  set i.dbg_pc_we 1 (b (Option.is_some debug.write_pc));
+  set i.dbg_idx 3 (Option.value_map debug.write_reg ~default:0 ~f:fst);
+  (match debug.write_reg, debug.write_pc with
+   | Some (_, v), _ | None, Some v -> set i.host_data 16 v
+   | None, None -> ());
   let rtl_read = if reading then Some (get t.o.outbox_head) else None in
   Cyclesim.cycle t.sim;
   (* this cycle's flag requests, seen just before the edge *)
   t.flags <- t.flags land lnot (get t.before.flag_clr) lor get t.before.flag_set;
-  Model.step t.model pads;
+  let model_trigger = Model.bp_trigger ~debug t.model in
+  if get t.before.dbg_trigger <> Bool.to_int model_trigger
+  then
+    raise
+      (Mismatch
+         [%message "breakpoint trigger differs" ~cycle:(t.cycle : int) (model_trigger : bool)]);
+  Model.step ~debug ~others_hit t.model pads;
   if writing then assert (Model.host_send t.model (Option.value_exn send));
   let model_read = if reading then Model.host_receive t.model else None in
   if not ([%equal: int option] rtl_read model_read)

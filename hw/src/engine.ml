@@ -32,6 +32,16 @@ module I = struct
     ; cfg_data : 'a [@bits 32]
     ; time : 'a [@bits 32] (* the chip's cycle counter *)
     ; ev_flags : 'a [@bits 8] (* the chip's event flags *)
+    ; dbg_bp : 'a [@bits 8] (* breakpoint pc (ADR 0013) *)
+    ; dbg_bp_on : 'a
+    ; dbg_join : 'a (* also stop when another engine hits its breakpoint *)
+    ; dbg_others_hit : 'a (* another engine's breakpoint fired this cycle *)
+    ; dbg_stop : 'a
+    ; dbg_resume : 'a
+    ; dbg_step : 'a (* run the sequencer for this cycle only *)
+    ; dbg_reg_we : 'a (* host writes host_data to register dbg_idx (only while stopped) *)
+    ; dbg_pc_we : 'a (* host writes host_data to pc (only while stopped) *)
+    ; dbg_idx : 'a [@bits 3]
     }
   [@@deriving hardcaml]
 end
@@ -55,6 +65,9 @@ module O = struct
     ; bstat : 'a [@bits 4]
     ; be_enabled : 'a
     ; prog_q : 'a [@bits 16] (* program word at the prog_addr of the cycle before *)
+    ; dbg_stopped : 'a
+    ; dbg_by_bp : 'a
+    ; dbg_trigger : 'a (* this engine's breakpoint fired, for the other engines *)
     }
   [@@deriving hardcaml]
 end
@@ -123,6 +136,9 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   let var w = Variable.reg spec ~width:w in
   let pc = var 8
   and halted = var 1
+  and dbg_stopped = var 1
+  and dbg_by_bp = var 1
+  and dbg_skip = var 1
   and busy = var 8
   and busy_next = var 8
   and fails = var 16
@@ -293,7 +309,22 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   let timeout = (tmo <>:. 0) &: (uresize fails.value ~width:17 +:. 1 >=: uresize tmo ~width:17) in
   let complete = ready |: timeout in
   (* ---------- next PC ---------- *)
-  let exec = run &: ~:(halted.value) &: (busy.value ==:. 0) in
+  (* debug stop (ADR 0013): a third reason not to issue, next to HALT and a delay count. Only the
+     sequencer freezes; the bit engine and everything else keep running *)
+  let bp_hit =
+    run
+    &: i.dbg_bp_on
+    &: (pc.value ==: i.dbg_bp)
+    &: ~:(halted.value)
+    &: (busy.value ==:. 0)
+    &: ~:(dbg_skip.value)
+  in
+  let dbg_trigger = bp_hit &: ~:(i.dbg_step) in
+  let any_hit = dbg_trigger |: i.dbg_others_hit in
+  let stop_now = ~:(i.dbg_step) &: (dbg_stopped.value |: bp_hit |: (i.dbg_join &: any_hit)) in
+  let go = run &: ~:(halted.value) &: ~:stop_now in
+  let exec = go &: (busy.value ==:. 0) in
+  let host_pc = i.dbg_pc_we &: dbg_stopped.value in
   let delay = mux2 (is 11) imm8 (uresize (f 2 0) ~width:8) in
   let has_delay = is 7 |: is 8 |: is 11 in
   let ret_pc = mux (sp.value -:. 1) (Array.to_list (Array.map stack ~f:(fun v -> v.value))) in
@@ -319,18 +350,13 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
                      (mux2 (delay ==:. 0) pc1 pc.value)
                      (mux2 is_wait (mux2 complete pc1 pc.value) pc1))))))
   in
-  assign
-    next_pc
-    (mux2
-       ~:run
-       (zero 8)
-       (mux2
-          halted.value
-          pc.value
-          (mux2
-             (busy.value <>:. 0)
-             (mux2 (busy.value ==:. 1) busy_next.value pc.value)
-             exec_next)));
+  let next_pc_prog =
+    mux2
+      (halted.value |: stop_now)
+      pc.value
+      (mux2 (busy.value <>:. 0) (mux2 (busy.value ==:. 1) busy_next.value pc.value) exec_next)
+  in
+  assign next_pc (mux2 ~:run (zero 8) (mux2 host_pc i.host_data.:[7, 0] next_pc_prog));
   (* ---------- CSR read ---------- *)
   let caddr = f 5 0 in
   let bstat =
@@ -611,7 +637,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
          ; sync1_ui <-- i.ui_in
          ; sync2_uio <-- sync1_uio.value
          ; sync2_ui <-- sync1_ui.value
-         ; when_ (run &: ~:(halted.value) &: (busy.value <>:. 0)) [ busy <-- busy.value -:. 1 ]
+         ; when_ (go &: (busy.value <>:. 0)) [ busy <-- busy.value -:. 1 ]
          ; when_ (exec &: has_delay &: (delay <>:. 0)) [ busy <-- delay; busy_next <-- pc1 ]
          ; when_ (exec &: sys 1) [ halted <-- vdd ]
          ; when_ (exec &: is 6) [ sp <-- sp.value +:. 1 ]
@@ -629,6 +655,26 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
          ]
        ; List.init 4 ~f:(fun k -> when_ (exec &: is 6 &: (sp.value ==:. k)) [ stack.(k) <-- pc1 ])
        ; List.init 8 ~f:(fun k -> when_ (wb_en &: (wb_idx ==:. k)) [ regs.(k) <-- wb_val ])
+       ; (* debug: host writes win over the program's (they only happen while stopped) *)
+         List.init 8 ~f:(fun k ->
+           when_
+             (i.dbg_reg_we &: dbg_stopped.value &: (i.dbg_idx ==:. k))
+             [ regs.(k) <-- i.host_data ])
+       ; [ when_ host_pc [ halted <-- gnd; busy <-- zero 8 ]
+         ; (let newly =
+              ~:(dbg_stopped.value) &: ~:(i.dbg_step) &: (bp_hit |: (i.dbg_join &: any_hit))
+            in
+            if_
+              i.dbg_resume
+              [ dbg_stopped <-- gnd; dbg_by_bp <-- gnd; dbg_skip <-- vdd ]
+              [ when_ newly [ dbg_by_bp <-- vdd ]
+              ; when_ (newly |: i.dbg_stop) [ dbg_stopped <-- vdd ]
+              ; if_
+                  i.dbg_step
+                  [ dbg_skip <-- vdd ]
+                  [ when_ (next_pc_prog <>: pc.value) [ dbg_skip <-- gnd ] ]
+              ])
+         ]
        ; List.concat (List.init 15 ~f:per_pin)
        ; bit_engine_updates
        ; List.map csrs ~f:(fun (addr, mask, v) ->
@@ -661,6 +707,9 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   ; bstat
   ; be_enabled = be_en.value
   ; prog_q = instr
+  ; dbg_stopped = dbg_stopped.value
+  ; dbg_by_bp = dbg_by_bp.value
+  ; dbg_trigger
   }
 ;;
 

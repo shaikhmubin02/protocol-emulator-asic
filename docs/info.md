@@ -47,6 +47,36 @@ Address bits [15:14] pick the engine and [13:12] the region:
 Each mailbox holds two words each way. Read the status word to see how many are waiting before
 reading the outbox, and only write the inbox when it has room.
 
+### Debugging on the chip
+
+Each engine can be stopped, single-stepped and inspected over the host port while it runs
+real protocol traffic.
+
+| Region | Offset | What |
+|---|---|---|
+| 2 | 0x00 | write while stopped: set the pc (also clears HALT and any delay left) |
+| 2 | 0x01 | breakpoint: [7:0] pc, [8] on, [9] join; reads back also [10] stopped, [11] stopped by a breakpoint |
+| 2 | 0x02 | read: [0] Z, [1] C, [2] T, [4:3] stack depth, [15:8] delay cycles left |
+| 2 | 0x10-0x17 | write while stopped: registers r0-r7 |
+| 3 | 0x14 | write: [3:0] stop, [7:4] resume, [11:8] step, one bit per engine; read: [3:0] stopped, [7:4] stopped by a breakpoint |
+
+The status word (region 2, 0x00) also has [15] stopped.
+
+- A stop freezes only the engine's sequencer: pc, registers, flags, the delay count. Its bit
+  engine, fabric, CRC unit, mailbox and the shared cycle counter keep going, so a byte already
+  handed to the TX shifter still goes out.
+- A breakpoint stops the engine just before it issues the instruction at that pc.
+- Join: when any engine hits its breakpoint, every engine with join set stops in the same clock
+  cycle. Reading all four engines afterwards gives one consistent picture of the whole chip at
+  that cycle, for example an SPI master and the I2C engine it is waiting on.
+- Step runs the sequencer for exactly one clock cycle, which fits the cycle-exact instruction
+  set: an instruction with a delay of n takes n + 1 steps, and a wait checks its condition once
+  per step. Stop, resume and step act on several engines in the same cycle.
+- After resume or step, a breakpoint at the current pc doesn't fire again until the pc has
+  moved, so resuming from a breakpoint (or from a wait sitting on one) just carries on.
+- Time keeps running while an engine is stopped: after a resume, `wait time` deadlines that
+  have passed complete at once, and a protocol partner may have timed out.
+
 ### Example firmware
 
 All of these are in `hw/firmware` and assemble with the assembler in `hw/bin`. Times assume a

@@ -45,6 +45,77 @@ let run_random ?(lite = false) ~seed ~cycles () =
   done
 ;;
 
+(* The same random programs, with the host poking the debug logic at random (ADR 0013). *)
+let debug_coverage = Array.create ~len:7 0
+
+let run_random_debug ~seed ~cycles =
+  let rng = Random.State.make [| seed; 13 |] in
+  let program = Random_program.create rng in
+  let ls = Lockstep.create program in
+  let chance n = Random.State.int rng n = 0 in
+  for _ = 1 to cycles do
+    let m = ls.model in
+    if chance 40
+    then (
+      (* mostly near the current pc, so that breakpoints actually fire *)
+      let pc = (m.pc + Random.State.int rng 6) land 0xff in
+      Lockstep.set_breakpoint ls ~pc ~on:(not (chance 4)) ~join:(chance 2));
+    let stopped = Model.stopped m in
+    let write_reg = if stopped && chance 20 then Some (Random.State.int rng 8, Random.State.int rng 0x10000) else None in
+    let write_pc =
+      if stopped && Option.is_none write_reg && chance 60
+      then Some (Random.State.int rng (Array.length program))
+      else None
+    in
+    let debug =
+      { Model.Debug_cmd.stop = chance 80
+      ; resume = (if stopped then chance 30 else chance 200)
+      ; step = stopped && chance 3
+      ; write_reg
+      ; write_pc
+      }
+    in
+    let others_hit = chance 60 in
+    let host_writing = Option.is_some write_reg || Option.is_some write_pc in
+    let send = if (not host_writing) && chance 4 then Some (Random.State.int rng 0x10000) else None in
+    let pads = { Model.Pads.uio_in = Random.State.int rng 256; ui_in = Random.State.int rng 256 } in
+    let hit = Model.bp_trigger ~debug m
+    and by_bp_before = m.dbg.by_bp in
+    ignore (Lockstep.step ?send ~receive:(chance 3) ~debug ~others_hit ls pads : int option * bool);
+    let bump k b = if b then debug_coverage.(k) <- debug_coverage.(k) + 1 in
+    bump 0 hit;
+    bump 1 (m.dbg.by_bp && (not by_bp_before) && not hit);
+    bump 2 (stopped && debug.step);
+    bump 3 (stopped && Option.is_some write_reg);
+    bump 4 (stopped && Option.is_some write_pc);
+    bump 5 (stopped && debug.resume);
+    bump 6 stopped
+  done
+;;
+
+let%expect_test "random programs with random debug commands: RTL = model every cycle" =
+  let programs = 300
+  and cycles = 2000 in
+  for seed = 1 to programs do
+    try run_random_debug ~seed ~cycles with
+    | Lockstep.Mismatch s -> raise_s [%message "seed" (seed : int) (s : Sexp.t)]
+  done;
+  printf "%d random programs x %d cycles: no difference\n" programs cycles;
+  printf
+    "breakpoint hits %d, stops through another engine %d, steps %d, register writes %d, pc writes %d, resumes %d, cycles stopped %d\n"
+    debug_coverage.(0)
+    debug_coverage.(1)
+    debug_coverage.(2)
+    debug_coverage.(3)
+    debug_coverage.(4)
+    debug_coverage.(5)
+    debug_coverage.(6);
+  [%expect {|
+    300 random programs x 2000 cycles: no difference
+    breakpoint hits 8036, stops through another engine 2327, steps 89944, register writes 13440, pc writes 4326, resumes 9036, cycles stopped 270071
+    |}]
+;;
+
 let%expect_test "random programs: RTL = model every cycle" =
   let programs = 300
   and cycles = 2000 in
