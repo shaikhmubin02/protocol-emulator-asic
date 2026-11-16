@@ -13,8 +13,8 @@ Each engine also has an 8-element LUT fabric for bit-level coding such as bit st
 and a CRC unit up to 32 bits. Those are for protocols like USB and Ethernet; UART, SPI, I2C, JTAG
 and the like don't need them.
 
-The chip runs at 50 MHz. It is hardened with a 15 ns target so that 50 MHz still meets timing at
-the slow corner (1.08 V, 125 C): the longest path there is 18.8 ns, 12 ns at the typical corner.
+The chip runs at 50 MHz. It is hardened with an 18 ns target, checked at every corner including
+the slow one (1.08 V, 125 C), so at 50 MHz every path has at least 2 ns to spare.
 
 The engines share a 32-bit cycle counter and eight event flags, so they can start together or
 wait for each other. Programs that need exact timing keep a deadline in a register and wait for
