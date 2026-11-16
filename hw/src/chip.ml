@@ -173,6 +173,8 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
     in
     List.fold table ~init:(zero 16) ~f:(fun acc (k, v) -> mux2 (r_off ==:. k) v acc)
   in
+  (* loaded every cycle, but only used when the host reads a word. Reading program memory or
+     configuration that was never written gives whatever it powered up with. *)
   let read_word =
     reg
       spec
@@ -180,6 +182,7 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
          (r_region ==:. 3)
          global_word
          (mux r_engine (Array.to_list (Array.mapi engines ~f:(fun e o -> engine_word o e)))))
+    -- "host_read_word"
   in
   (* ---------- event flags ---------- *)
   let any f = List.reduce_exn (Array.to_list (Array.map engines ~f)) ~f:( |: ) in

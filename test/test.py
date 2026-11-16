@@ -6,6 +6,7 @@
 
 import os
 import random
+import re
 
 import cocotb
 from cocotb.clock import Clock
@@ -137,6 +138,88 @@ async def test_program_readback(dut):
     for e, w in words.items():
         back = await b.read(program(e, 200), len(w))
         assert back == w, f"engine {e}: wrote {w}, read {back}"
+
+
+def flop_names():
+    """The registers in each module of src/pemu.v: everything assigned in a clocked block."""
+    with open(os.path.join(HERE, "..", "src", "pemu.v")) as f:
+        src = f.read()
+    names = {}
+    for module, body in re.findall(r"^module (\w+) \((.*?)^endmodule", src, re.S | re.M):
+        blocks = re.findall(r"always @\(posedge \w+ or negedge \w+\) begin(.*?)\n    end\n", body, re.S)
+        names[module] = sorted({n for b in blocks for n in re.findall(r"(\w+) <=", b)})
+    return names
+
+
+# Allowed to hold unwritten data: the word the host port reads next. It is loaded every cycle
+# from whatever the address points at, and only used when the host reads that word.
+UNWRITTEN_OK = {"host_read_word"}
+
+
+def unknown_flops(dut, allow=()):
+    """Flops holding X or Z. On silicon such a flop would hold whatever the latches and SRAM
+    happened to power up with."""
+    names = flop_names()
+    allow = UNWRITTEN_OK | set(allow)
+    top = dut.user_project
+    where = [("top", top, names["tt_um_shaikhmubin02_pemu"])]
+    where += [(f"engine{e}", getattr(top, f"engine{e}"), names["engine"]) for e in range(4)]
+    bad = []
+    for label, inst, regs in where:
+        for r in regs:
+            if r in allow:
+                continue
+            v = str(getattr(inst, r).value)
+            if any(c not in "01" for c in v):
+                bad.append(f"{label}.{r} = {v}")
+    return bad
+
+
+@cocotb.test(skip=os.environ.get("GATES") == "yes")
+async def test_power_up_state(dut):
+    """The 1,248 configuration latches and the SRAMs aren't reset, and the simulator starts them
+    as X. Run uart.s on all four engines with no fabric or CRC configuration written: no driven
+    pin may ever depend on those unwritten values, and the only flops that may are the fabric
+    flops, which BEN 1 loads from the configuration (and which nothing reads while the fabric is
+    off). Then write the configuration, restart, and every flop must be known."""
+    b = await start(dut)
+    assert not unknown_flops(dut), "after reset"
+
+    async def watch_pins():
+        while True:
+            await FallingEdge(dut.clk)
+            oe = str(dut.uio_oe.value)
+            out = str(dut.uio_out.value)
+            assert set(str(dut.uo_out.value)) <= {"0", "1"}, f"uo_out = {dut.uo_out.value}"
+            assert set(oe) <= {"0", "1"}, f"uio_oe = {oe}"
+            assert all(o == "0" or v in "01" for o, v in zip(oe, out)), f"uio_out = {out}"
+
+    cocotb.start_soon(watch_pins())
+    for e in range(4):
+        await b.write(program(e), firmware("uart.hex"))
+    await b.write(glob(8), [0b100 | 1])  # pin 8 (uo[0]) belongs to engine 1
+    await b.write(glob(0x10), [0b1111])  # run all four engines
+    b.loop_tx_to_rx = True
+    for byte in (0x00, 0xFF, 0x5A):
+        await b.write(mailbox(1), [byte])
+        for _ in range(50):
+            st = await b.read1(status(1))
+            if (st >> 12) & 3:
+                break
+        assert await b.read1(mailbox(1)) == byte
+    fabric = [f"fab_q{k}" for k in range(8)]
+    bad = unknown_flops(dut, allow=fabric)
+    assert not bad, f"{len(bad)} flops depend on power-up values: {bad[:20]}"
+    assert len(unknown_flops(dut)) == 4 * 8, "the fabric flops should still be unknown"
+
+    await b.write(glob(0x10), [0])  # stop, write every configuration word, run again
+    for e in range(4):
+        await b.write(engine_addr(e, 1, 0), [0] * 16)  # fabric elements 0-7
+        await b.write(engine_addr(e, 1, 32), [0] * 4)  # CRC polynomial and init
+    await b.write(glob(0x10), [0b1111])
+    await b.wait(100)
+    bad = unknown_flops(dut)
+    assert not bad, f"after writing the configuration: {bad[:20]}"
 
 
 @cocotb.test()

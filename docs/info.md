@@ -107,7 +107,10 @@ when the two pins are wired together.
 Some things to know:
 
 - Hold rst_n low after power-up; the engines and the host port start from reset, not from
-  whatever the flops came up as.
+  whatever the flops came up as. Every flop on the chip has rst_n. Program memory and the fabric
+  and CRC configuration (latches) are not reset: they hold junk until written. A program that
+  uses the fabric or the CRC unit needs all 18 configuration words written before it starts; one
+  that uses neither needs none, because nothing reads the configuration while they are off.
 - When the design is deselected on the board it loses power and its programs. Load them again
   after selecting it.
 - uo pins read 0 until their engine drives them. A UART on uo[0] therefore looks like a break

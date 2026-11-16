@@ -175,7 +175,15 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   and crc = var 32
   and crc_out = var 1
   and flag_latch = var 1 in
-  let fab_q = Array.init n_le ~f:(fun _ -> var 1) in
+  (* BEN 1 loads these from the configuration's init bits. Until the host has written the
+     configuration they hold whatever the latches powered up with, which is harmless: every
+     path out of the fabric goes through [role], which is off unless TXCFG/RXCFG[10] is set *)
+  let fab_q =
+    Array.init n_le ~f:(fun k ->
+      let v = var 1 in
+      ignore (v.value -- sprintf "fab_q%d" k : Signal.t);
+      v)
+  in
   let cfg_word addr ~width =
     if lite
     then zero width
