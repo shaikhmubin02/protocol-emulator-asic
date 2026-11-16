@@ -67,6 +67,11 @@
   "//": "The chip runs at 50 MHz. I harden at 15 ns so the slow corner still meets 20 ns.",
   "CLOCK_PERIOD": 15,
 
+  "//": "Map for area and leave timing to the resizer after placement. With LibreLane 3.1.0.dev4 the",
+  "//": "default DELAY 4 strategy added about 11,000 buffers in synthesis (+34% area) and routing",
+  "//": "no longer finished in 6 hours.",
+  "SYNTH_STRATEGY": "AREA 0",
+
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
   "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,
   "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.05,
