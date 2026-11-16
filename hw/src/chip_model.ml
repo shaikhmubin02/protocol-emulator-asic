@@ -55,7 +55,7 @@ type t =
 let create () =
   { engines =
       Array.init n_engines ~f:(fun e ->
-        { lite = e >= 2
+        { lite = Chip.lite e
         ; mem = Array.create ~len:256 0
         ; cfg = Array.create ~len:n_cfg 0
         ; model = None

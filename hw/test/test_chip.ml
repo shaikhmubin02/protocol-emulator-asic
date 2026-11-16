@@ -136,7 +136,7 @@ let%expect_test "mailbox reads one word at a time lose nothing" =
 
 (* Three engines at once, each with its own device on its own pins, all loaded and serviced over
    the host port: engine 0 is an SPI master in mode 3, engine 1 an I2C master at 400 kHz (taking
-   the clock as 50 MHz) against an EEPROM that stretches the clock, engine 2 (a lite engine) a
+   the clock as 50 MHz) against an EEPROM that stretches the clock, engine 2 a
    UART looped back on itself. *)
 let%expect_test "SPI, I2C and UART running at the same time" =
   let open Devices in

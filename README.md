@@ -26,8 +26,8 @@ Firmware in `hw/firmware`, each one tested against a model of the device on the 
   them onto a 4-bit bus with the FCS checked. RX jitter tolerance is below what 802.3 asks for at
   50 MHz; the datasheet has the numbers
 
-Engines 0 and 1 also have a small LUT fabric and a CRC unit for bit-level coding; USB and
-10BASE-T use them.
+Each engine also has a small LUT fabric and a CRC unit for bit-level coding; USB and 10BASE-T
+use them, and any engine can run them.
 
 ## How it's checked
 
