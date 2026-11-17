@@ -55,13 +55,34 @@ class Board:
         self.mosi = 0
         self.ui = 0  # ui[7:3]
         self.loop_tx_to_rx = False  # uo[0] -> ui[3]
+        self.devices = []  # models of what is wired to the protocol pins (see step below)
+        self.dev_low = 0
+        self.line = 0xFF
+        self.cycle = 0
 
     async def drive(self):
         while True:
             await FallingEdge(self.dut.clk)
+            self.cycle += 1
             ui = self.ui
             if self.loop_tx_to_rx:
                 ui = (ui & ~0x08) | ((self.uo() & 1) << 3)
+            if self.devices:
+                # open-drain uio pins: low if the chip drives them low or a device pulls them
+                # low, otherwise the pull-up holds them high
+                oe, out = int(self.dut.uio_oe.value), int(self.dut.uio_out.value)
+                chip_low = oe & ~out & 0xFF
+                self.chip_low = chip_low
+                self.line = ~(chip_low | self.dev_low) & 0xFF  # what the devices see now
+                dev_low, dev_ui = 0, 0
+                for d in self.devices:
+                    lo, u = d.step(self)
+                    dev_low |= lo
+                    dev_ui |= u
+                self.dev_low = dev_low
+                self.uio = ~(chip_low | dev_low) & 0xFF
+                self.dut.uio_in.value = self.uio
+                ui |= dev_ui
             self.dut.ui_in.value = (ui & 0xF8) | (self.mosi << 2) | (self.cs_n << 1) | self.sck
 
     def uo(self):
@@ -286,3 +307,202 @@ async def test_uart_loopback(dut):
         if inbox < 2 and pending:
             await b.write(mailbox(1), [pending.pop(0)])
     assert got == sent, f"sent {sent}, got {got}"
+
+
+# ---- models of the devices on the other end, written from the protocol rules ----
+# Each step() runs once a clock (on the falling edge) and returns (uio pins it pulls low,
+# ui bits it drives).
+
+
+class SpiTarget:
+    """SPI mode 0 target on SCK = uo[1], MOSI = uo[2], CS = uo[3], MISO = ui[4]: samples MOSI on
+    the rising edge, changes MISO on the falling edge, first bit out as soon as CS goes low.
+    A reply byte is used up only once all 8 of its bits have been clocked: the chip holds every
+    uo pin it doesn't own low, so CS reads low until the firmware takes the pin, with no clock."""
+
+    def __init__(self, reply):
+        self.reply, self.k = reply, 0
+        self.received, self.sh, self.n = [], 0, 0
+        self.miso, self.prev = 1, (0, 1)
+
+    def bit(self):
+        return (self.reply[self.k % len(self.reply)] >> (7 - self.n)) & 1
+
+    def step(self, b):
+        uo = b.uo()
+        sck, mosi, cs = (uo >> 1) & 1, (uo >> 2) & 1, (uo >> 3) & 1
+        psck, pcs = self.prev
+        self.prev = (sck, cs)
+        if pcs and not cs:
+            self.n, self.sh = 0, 0
+            self.miso = self.bit()
+        elif not cs and sck and not psck:
+            self.sh = ((self.sh << 1) | mosi) & 0xFF
+            self.n += 1
+            if self.n == 8:
+                self.received.append(self.sh)
+                self.n, self.k = 0, self.k + 1
+        elif not cs and psck and not sck:
+            self.miso = self.bit()
+        return 0, self.miso << 4
+
+
+class I2cTarget:
+    """I2C target with 256 bytes of memory on SCL = uio[0], SDA = uio[1]. The first byte written
+    after the address sets the pointer, the rest are stored; reads come from the pointer.
+    SDA only changes while SCL is low."""
+
+    def __init__(self, addr):
+        self.addr, self.mem, self.ptr = addr, [0] * 256, 0
+        self.state, self.prev, self.low = "idle", (1, 1), 0
+        self.n, self.sh, self.acked = 0, 0, False
+
+    def send_byte(self):
+        self.byte = self.mem[self.ptr]
+        self.ptr = (self.ptr + 1) & 0xFF
+        self.state, self.n = "read", 0
+        self.low = 1 - (self.byte >> 7)
+
+    def step(self, b):
+        scl, sda = b.line & 1, (b.line >> 1) & 1
+        pscl, psda = self.prev
+        self.prev = (scl, sda)
+        rise, fall = scl and not pscl, pscl and not scl
+        if scl and pscl and psda and not sda:  # START or repeated START
+            self.state, self.n, self.sh, self.low = "addr", 0, 0, 0
+        elif scl and pscl and not psda and sda:  # STOP
+            self.state, self.low = "idle", 0
+        elif self.state in ("addr", "write") and rise and self.n < 8:
+            self.sh = ((self.sh << 1) | sda) & 0xFF
+            self.n += 1
+        elif self.state in ("addr", "write") and fall and self.n == 8:
+            if self.state == "addr":
+                if self.sh >> 1 != self.addr:
+                    self.state = "idle"
+                    return 0, 0
+                self.reading, self.first = self.sh & 1, True
+            elif self.first:
+                self.ptr, self.first = self.sh, False
+            else:
+                self.mem[self.ptr] = self.sh
+                self.ptr = (self.ptr + 1) & 0xFF
+            self.state, self.low = "ack", 1
+        elif self.state == "ack" and fall:
+            self.low = 0
+            if self.reading:
+                self.send_byte()
+            else:
+                self.state, self.n, self.sh = "write", 0, 0
+        elif self.state == "read" and rise and self.n == 8:
+            self.acked = sda == 0  # the master's ACK bit
+        elif self.state == "read" and fall:
+            self.n += 1
+            if self.n < 8:
+                self.low = 1 - ((self.byte >> (7 - self.n)) & 1)
+            elif self.n == 8:
+                self.low = 0  # let go for the master's ACK
+            elif self.acked:
+                self.send_byte()
+            else:
+                self.state, self.low = "idle", 0
+        return self.low << 1, 0
+
+
+class OneWireDevice:
+    """1-Wire device on uio[2] that answers a reset with a presence pulse and READ ROM (0x33)
+    with its 8-byte ROM, LSB first. [us] is clock cycles per microsecond."""
+
+    def __init__(self, us, rom):
+        self.us, self.rom = us, rom
+        self.bits = [(rom[k // 8] >> (k % 8)) & 1 for k in range(64)]
+        self.fell, self.low_from, self.low_until = 0, 0, 0
+        self.mode, self.written, self.was_low = "idle", [], False
+        self.i, self.n, self.sh = 0, 0, 0
+
+    def step(self, b):
+        now, us = b.cycle, self.us
+        master_low = (b.chip_low >> 2) & 1
+        if master_low and not self.was_low:
+            self.fell = now
+            if self.mode == "rom":
+                if self.bits[self.i] == 0:
+                    self.low_from, self.low_until = now, now + 30 * us
+                self.i += 1
+                if self.i == 64:
+                    self.mode = "idle"
+        elif self.was_low and not master_low:
+            width = now - self.fell
+            if width >= 480 * us:
+                self.low_from, self.low_until = now + 30 * us, now + 150 * us
+                self.mode, self.sh, self.n = "cmd", 0, 0
+            elif self.mode == "cmd":
+                self.sh |= (1 if width < 15 * us else 0) << self.n
+                self.n += 1
+                if self.n == 8:
+                    self.written.append(self.sh)
+                    self.mode, self.i = ("rom", 0) if self.sh == 0x33 else ("idle", 0)
+        self.was_low = master_low
+        return (1 << 2) if self.low_from <= now < self.low_until else 0, 0
+
+
+def crc8_maxim(data):
+    crc = 0
+    for byte in data:
+        for k in range(8):
+            mix = (crc ^ (byte >> k)) & 1
+            crc >>= 1
+            if mix:
+                crc ^= 0x8C
+    return crc
+
+
+@cocotb.test()
+async def test_four_protocols_at_once(dut):
+    """All four engines at once, each a different protocol, through the pins only: SPI master
+    (engine 0), UART looped back (engine 1), I2C master with a repeated START (engine 2) and
+    1-Wire reading a ROM ID (engine 3), against device models on the far side."""
+    b = await start(dut)
+    spi = SpiTarget([0x12, 0x34, 0x56])
+    i2c = I2cTarget(0x50)
+    i2c.mem[0x11] = 0x77
+    rom = [0x28, 1, 2, 3, 4, 5, 6]
+    rom.append(crc8_maxim(rom))
+    ow = OneWireDevice(5, rom)
+    b.devices = [spi, i2c, ow]
+    b.loop_tx_to_rx = True
+    fw = {0: "spi_master.hex", 1: "uart.hex", 2: "i2c_master.hex", 3: "onewire.hex"}
+    owners = {9: 0, 10: 0, 11: 0, 8: 1, 0: 2, 1: 2, 2: 3}
+    for e, name in fw.items():
+        await b.write(program(e), firmware(name))
+    for pin, e in owners.items():
+        await b.write(glob(pin), [0b100 | e])
+    await b.write(glob(0x10), [0b1111])
+    words = {
+        0: [0x1A5, 0x03C, 0x2F0],  # CS low, A5, 3C, F0, CS high
+        1: [0x00, 0xFF, 0x5A, 0xC3],
+        # Q = 8; write 0x10 <- 5A, 6B; then set the pointer, repeated START, read two bytes
+        2: [0x608, 0x100, 0x2A0, 0x210, 0x25A, 0x26B, 0x500,
+            0x100, 0x2A0, 0x210, 0x100, 0x2A1, 0x300, 0x400, 0x500],
+        3: [0x405, 0x100, 0x233] + [0x300] * 8,  # 5 cycles a us, reset, READ ROM, 8 bytes
+    }
+    want = {0: [0x12, 0x34, 0x56], 1: [0x00, 0xFF, 0x5A, 0xC3],
+            2: [0] * 7 + [0x5A, 0x6B], 3: [0] + rom}
+    pending = {e: list(w) for e, w in words.items()}
+    got = {e: [] for e in words}
+    for _ in range(400):
+        if all(len(got[e]) >= len(want[e]) for e in want):
+            break
+        for e in words:
+            st = await b.read1(status(e))
+            inbox, outbox = (st >> 10) & 3, (st >> 12) & 3
+            if outbox:
+                got[e] += await b.read(mailbox(e), outbox)
+            if inbox < 2 and pending[e]:
+                n = min(2 - inbox, len(pending[e]))
+                await b.write(mailbox(e), pending[e][:n])
+                del pending[e][:n]
+    dut._log.info(f"{b.cycle} cycles; replies {got}")
+    assert got[0] == want[0] and spi.received == [0xA5, 0x3C, 0xF0], (got[0], spi.received)
+    assert got[1] == want[1], got[1]
+    assert got[2] == want[2] and i2c.mem[0x10:0x12] == [0x5A, 0x6B], (got[2], i2c.mem[0x10:0x12])
+    assert got[3] == want[3] and ow.written == [0x33], (got[3], ow.written)
