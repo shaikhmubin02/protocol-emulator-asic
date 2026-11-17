@@ -288,7 +288,9 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
       wait_kind
       [ read_pin (f 9 5) ==: f 4 4
       ; mux (f 2 0) flag_list ==: f 3 3
-      ; ~:(msb (time.:[15, 0] -: reg_c))
+      ; (* WAIT TIME: compared against every register at the start of the cycle, while the
+         instruction is still coming out of the SRAM, so only a select is left after it *)
+        mux (f 2 0) (Array.to_list (Array.map regs ~f:(fun r -> ~:(msb (time.:[15, 0] -: r.value)))))
       ; mux
           (f 3 0)
           [ ~:(hold_v.value); rx_ready.value; tx_tick; captured.value; inbox_has ]
@@ -418,8 +420,8 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
         |: is 5
         |: is 9
         |: is 12
-        |: (sys 4 &: ready)
-        |: (sys 8 &: ready))
+        |: (sys 4 &: inbox_has)
+        |: (sys 8 &: rx_ready.value))
   in
   (* flags *)
   let z_new = mux2 (is 1) (wb_val ==:. 0) alu.z in
@@ -447,8 +449,10 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   let outg_bits = place a.:[7, 0]
   and outg_mask = place (below outg_count ~width:8) in
   (* ---------- the state update ---------- *)
-  let in_pop = exec &: sys 4 &: ready in
-  let out_push = exec &: sys 3 &: ready in
+  (* PULL and PUSH use their own condition rather than [ready], which also carries the wait
+     conditions: the same value, but a much shorter path for timing *)
+  let in_pop = exec &: sys 4 &: inbox_has in
+  let out_push = exec &: sys 3 &: outbox_room in
   let wait_done = exec &: is_wait &: complete in
   let capcfg = csr_value Isa.Csr.capcfg in
   let cap_pin = capcfg.:[4, 0] in
