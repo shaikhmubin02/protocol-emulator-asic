@@ -4,6 +4,8 @@ This file is used to generate your project datasheet.
 
 ## How it works
 
+The instruction set, control registers and bit engine are described in [isa.md](isa.md).
+
 The chip has four small engines. Each one is a processor built for talking to pins: every
 instruction takes a known number of clock cycles, so a program can produce or check a waveform
 down to the exact cycle. This is proven on the generated Verilog for any program: one cycle per
