@@ -150,6 +150,7 @@ let load name =
 let%expect_test "spi_master.s in lockstep against an SPI target, all four modes" =
   for mode = 0 to 3 do
     let ls = Lockstep.create (load "spi_master.s") in
+    Lockstep.record ls (sprintf "spi_master_mode%d" mode);
     let pending = Queue.of_list [ 0x8000 lor mode; 0x1A5; 0x03C; 0x2F0 ] in
     let miso = ref 0
     and prev_sck = ref 0
@@ -162,12 +163,17 @@ let%expect_test "spi_master.s in lockstep against an SPI target, all four modes"
       in
       if wrote then ignore (Queue.dequeue_exn pending : int);
       Option.iter read ~f:(fun v -> got := v :: !got);
-      (* tiny target: shifts out 0x5A repeatedly on falling edges *)
+      (* tiny target: shifts out 0x5A repeatedly, changing MISO on the edge the master doesn't
+         sample on (the falling edge in modes 0 and 3, the rising edge in modes 1 and 2) *)
       let sck = bit (Lockstep.uo ls) 1 in
-      if sck = 0 && !prev_sck = 1 then shift := ((!shift lsl 1) lor (!shift lsr 7)) land 0xff;
+      let change_on_fall = mode = 0 || mode = 3 in
+      if sck <> !prev_sck && Bool.equal (sck = 0) change_on_fall
+      then shift := ((!shift lsl 1) lor (!shift lsr 7)) land 0xff;
       miso := bit !shift 7;
       prev_sck := sck
     done;
+    Lockstep.note ls "mosi" [ 0xA5; 0x3C; 0xF0 ];
+    Lockstep.note ls "miso" (List.rev !got);
     printf "mode %d: %d cycles in lockstep, %d replies\n" mode ls.cycle (List.length !got)
   done;
   [%expect {|
@@ -180,6 +186,7 @@ let%expect_test "spi_master.s in lockstep against an SPI target, all four modes"
 
 let%expect_test "i2c_master.s in lockstep with a stretching target" =
   let ls = Lockstep.create (load "i2c_master.s") in
+  Lockstep.record ls "i2c_master";
   let pending = Queue.of_list [ 0x608; 0x100; 0x2A0; 0x210; 0x25A; 0x500; 0x100; 0x2A1; 0x300; 0x400; 0x500 ] in
   let stretch = ref 0
   and prev_scl = ref 1
@@ -202,12 +209,18 @@ let%expect_test "i2c_master.s in lockstep with a stretching target" =
     if wrote then ignore (Queue.dequeue_exn pending : int);
     Option.iter read ~f:(fun v -> got := v :: !got)
   done;
+  (* replies: an ACK bit for each of the four writes, then the two bytes read *)
+  Lockstep.note ls "addr_w" [ 0x50 ];
+  Lockstep.note ls "data_w" [ 0x10; 0x5A ];
+  Lockstep.note ls "addr_r" [ 0x50 ];
+  Lockstep.note ls "data_r" (List.drop (List.rev !got) 4);
   printf "%d cycles in lockstep, %d replies\n" ls.cycle (List.length !got);
   [%expect {| 20000 cycles in lockstep, 6 replies |}]
 ;;
 
 let%expect_test "uart.s in lockstep, TX wired back to RX" =
   let ls = Lockstep.create (load "uart.s") in
+  Lockstep.record ls "uart_loopback";
   let pending = Queue.of_list [ 0x00; 0xFF; 0x55; 0xA5; 0x3C ] in
   let got = ref [] in
   let tx = ref 1 in
@@ -220,6 +233,7 @@ let%expect_test "uart.s in lockstep, TX wired back to RX" =
   done;
   let got = List.rev !got in
   if not ([%equal: int list] got [ 0x00; 0xFF; 0x55; 0xA5; 0x3C ]) then raise_s [%message (got : int list)];
+  Lockstep.note ls "tx" got;
   printf "%d cycles in lockstep, echoed %s\n" ls.cycle (Sexp.to_string [%sexp (got : int list)]);
   [%expect {| 1500 cycles in lockstep, echoed (0 255 85 165 60) |}]
 ;;
@@ -268,12 +282,17 @@ let%expect_test "random programs on a lite engine (no fabric, no CRC)" =
 
 let%expect_test "ws2812.s in lockstep" =
   let ls = Lockstep.create (load "ws2812.s") in
+  Lockstep.record ls "ws2812";
   let pending = Queue.of_list (List.init 12 ~f:(fun k -> (k * 0x9e37) land 0xffff)) in
   for _ = 1 to 15_000 do
     let send = Queue.peek pending in
     let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
     if wrote then ignore (Queue.dequeue_exn pending : int)
   done;
+  (* 16-bit words go out MSB first: as bytes, the G R B stream of 8 LEDs *)
+  Lockstep.note ls "grb"
+    (List.concat_map (List.init 12 ~f:(fun k -> (k * 0x9e37) land 0xffff)) ~f:(fun w ->
+       [ w lsr 8; w land 0xff ]));
   printf "%d cycles in lockstep, %d words left\n" ls.cycle (Queue.length pending);
   [%expect {| 15000 cycles in lockstep, 0 words left |}]
 ;;
@@ -281,6 +300,7 @@ let%expect_test "ws2812.s in lockstep" =
 (* 1-Wire with time scaled down 10x (5 cycles a microsecond) to keep the RTL simulation short *)
 let%expect_test "onewire.s in lockstep against a 1-Wire device" =
   let ls = Lockstep.create (load "onewire.s") in
+  Lockstep.record ls ~ns_per_cycle:200. "onewire";
   let dev =
     Devices.One_wire_device.create ~us:5 ~family:0x28 ~serial:[ 1; 2; 3; 4; 5; 6 ]
   in
@@ -301,6 +321,8 @@ let%expect_test "onewire.s in lockstep against a 1-Wire device" =
   done;
   let got = List.rev !got in
   if not (List.is_empty dev.errors) then raise_s [%message (dev.errors : string list)];
+  Lockstep.note ls "write" [ 0x33 ];
+  Lockstep.note ls "read" (List.drop got 1);
   printf "%d cycles in lockstep, replies %s, ROM matches %b\n" ls.cycle
     (Sexp.to_string [%sexp (got : int list)])
     ([%equal: int list] (List.drop got 1) (Array.to_list dev.rom));
@@ -310,6 +332,8 @@ let%expect_test "onewire.s in lockstep against a 1-Wire device" =
 
 let%expect_test "usb_tx.s in lockstep" =
   let ls = Lockstep.create (load "usb_tx.s") in
+  (* a low-speed device: D- (p5) is pulled up, so a released bus idles at J *)
+  Lockstep.record ls ~ns_per_cycle:(1e9 /. 48e6) ~pullups:0x20 "usb_tx";
   let pending =
     Queue.of_list
       ([ 0x1C3 ] @ List.map [ 0x80; 0x06; 0xFF; 0xFF; 0xFF; 0x00 ] ~f:(fun b -> 0x200 lor b)
@@ -320,12 +344,15 @@ let%expect_test "usb_tx.s in lockstep" =
     let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
     if wrote then ignore (Queue.dequeue_exn pending : int)
   done;
+  Lockstep.note ls "pids" [ 0xC3; 0xD2 ];
+  Lockstep.note ls "data" [ 0x80; 0x06; 0xFF; 0xFF; 0xFF; 0x00 ];
   printf "%d cycles in lockstep, %d words left\n" ls.cycle (Queue.length pending);
   [%expect {| 6000 cycles in lockstep, 0 words left |}]
 ;;
 
 let%expect_test "usb_rx.s in lockstep, fed 1.5% slow" =
   let ls = Lockstep.create (load "usb_rx.s") in
+  Lockstep.record ls ~ns_per_cycle:(1e9 /. 48e6) "usb_rx";
   let far =
     Devices.Usb_ls_transmitter.create
       ~bit_ns:(1e9 /. 1.5e6 *. 1.015)
@@ -341,6 +368,8 @@ let%expect_test "usb_rx.s in lockstep, fed 1.5% slow" =
     in
     Option.iter read ~f:(fun _ -> incr got)
   done;
+  Lockstep.note ls "pids" [ 0xC3; 0xD2 ];
+  Lockstep.note ls "data" [ 0x80; 0x06; 0xFF; 0xFF ];
   printf "%d cycles in lockstep, %d words received\n" ls.cycle !got;
   [%expect {| 8000 cycles in lockstep, 10 words received |}]
 ;;
@@ -356,6 +385,7 @@ let%expect_test "eth_tx.s in lockstep, checked by the 802.3 receiver" =
     Lockstep.create ~fabric:(Bitstream.eth_tx ~n_le:Model.n_le) ~crc_poly:Bitstream.eth_poly
       ~crc_init:Bitstream.eth_tx_crc_init program
   in
+  Lockstep.record ls "eth_tx";
   let rx = Devices.Ten_base_t_receiver.create ~ns_per_cycle:20. in
   for cycle = 1 to 5_000 do
     let send = if cycle = 100 then Some 1 else None in
@@ -380,6 +410,7 @@ let%expect_test "eth_rx.s in lockstep, fed 100 ppm fast" =
     Lockstep.create ~fabric:(Bitstream.eth_rx ~n_le:Model.n_le) ~crc_poly:Bitstream.eth_poly
       ~crc_init:0xFFFF_FFFF program
   in
+  Lockstep.record ls "eth_rx";
   let frames = [ Devices.with_fcs (List.init 60 ~f:(fun k -> (k * 91) land 0xFF)) ] in
   let far =
     Devices.Ten_base_t_transmitter.create ~ns_per_cycle:20. ~bit_ns:99.99 ~jitter_ns:3.
@@ -401,6 +432,7 @@ let%expect_test "eth_rx.s in lockstep, fed 100 ppm fast" =
 
 let%expect_test "spi_target.s in lockstep, mode 3 at 1 MHz" =
   let ls = Lockstep.create (load "spi_target.s") in
+  Lockstep.record ls "spi_target";
   let ctrl =
     Devices.Spi_controller.create ~mode:3 ~half_ns:500. ~ns_per_cycle:20.
       [ [ 0x9F; 0x00; 0x00 ]; [ 0x05 ] ]
@@ -419,6 +451,8 @@ let%expect_test "spi_target.s in lockstep, mode 3 at 1 MHz" =
     Option.iter read ~f:(fun w -> got := w :: !got);
     miso := if bit (Lockstep.uio_oe ls) 0 = 1 then Some (bit (Lockstep.uio_out ls) 0) else None
   done;
+  Lockstep.note ls "mosi" [ 0x9F; 0x00; 0x00; 0x05 ];
+  Lockstep.note ls "miso" (List.concat (List.rev ctrl.received));
   printf "%d cycles in lockstep; controller read %s; host got %s\n" ls.cycle
     (Sexp.to_string [%sexp (List.rev ctrl.received : int list list)])
     (Sexp.to_string [%sexp (List.rev !got : int list)]);
@@ -427,6 +461,7 @@ let%expect_test "spi_target.s in lockstep, mode 3 at 1 MHz" =
 
 let%expect_test "i2c_target.s in lockstep, against i2c_master.s at 400 kHz" =
   let ls = Lockstep.create (load "i2c_target.s") in
+  Lockstep.record ls "i2c_target";
   let master = Model.create (load "i2c_master.s") in
   let mhost = Host.create [ 0x619; 0x100; 0x2A0; 0x210; 0x100; 0x2A1; 0x400; 0x500 ] in
   let pending = Queue.of_list [ 0x50; 0x99 ] in
@@ -449,6 +484,10 @@ let%expect_test "i2c_target.s in lockstep, against i2c_master.s at 400 kHz" =
     sda := line mo mv 1 land line to_ tv 1;
     Host.service mhost master
   done;
+  Lockstep.note ls "addr_w" [ 0x50 ];
+  Lockstep.note ls "data_w" [ 0x10 ];
+  Lockstep.note ls "addr_r" [ 0x50 ];
+  Lockstep.note ls "data_r" (List.drop (Host.received mhost) 3);
   printf "%d cycles in lockstep; target sent the host %s; master read %s\n" ls.cycle
     (Sexp.to_string [%sexp (List.rev_map !got ~f:(sprintf "0x%x") : string list)])
     (Sexp.to_string [%sexp (Host.received mhost : int list)]);

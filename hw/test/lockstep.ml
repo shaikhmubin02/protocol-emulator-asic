@@ -16,6 +16,7 @@ type t =
   ; program : int array
   ; mutable cycle : int
   ; mutable flags : int (* the chip-level flag register, kept here *)
+  ; mutable vcd : Pad_vcd.t option (* the RTL's pads, for sigrok (PEMU_VCD_DIR) *)
   }
 
 let create ?(lite = false) ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) program =
@@ -31,8 +32,11 @@ let create ?(lite = false) ?(fabric = [||]) ?(crc_poly = 0) ?(crc_init = 0) prog
   let model = Model.create ~lite program in
   Model.set_fabric model fabric;
   Model.set_crc model ~poly:crc_poly ~init:crc_init;
-  { sim; i; o; before; model; program; cycle = 0; flags = 0 }
+  { sim; i; o; before; model; program; cycle = 0; flags = 0; vcd = None }
 ;;
+
+(* record the pads from now on, if PEMU_VCD_DIR is set *)
+let record ?ns_per_cycle ?pullups t name = t.vcd <- Pad_vcd.create ?ns_per_cycle ?pullups name
 
 let get r = Bits.to_int_trunc !r
 
@@ -120,6 +124,16 @@ let step ?send ?(receive = false) ?(debug = Model.Debug_cmd.none) ?(others_hit =
   (match debug.write_reg, debug.write_pc with
    | Some (_, v), _ | None, Some v -> set i.host_data 16 v
    | None, None -> ());
+  Option.iter t.vcd ~f:(fun v ->
+    let out = get t.o.out
+    and oe = get t.o.oe in
+    Pad_vcd.sample
+      v
+      ~ui_in:pads.ui_in
+      ~uo_out:(out lsr 8)
+      ~uio_in:pads.uio_in
+      ~uio_out:(out land 0xff)
+      ~uio_oe:(oe land 0xff));
   let rtl_read = if reading then Some (get t.o.outbox_head) else None in
   Cyclesim.cycle t.sim;
   (* this cycle's flag requests, seen just before the edge *)
@@ -146,3 +160,6 @@ let step ?send ?(receive = false) ?(debug = Model.Debug_cmd.none) ?(others_hit =
 let uo t = get t.o.out lsr 8
 let uio_out t = get t.o.out land 0xff
 let uio_oe t = get t.o.oe land 0xff
+
+(* data the test knows, for the sigrok check (no-op unless recording) *)
+let note t key values = Option.iter t.vcd ~f:(fun v -> Pad_vcd.note v key values)

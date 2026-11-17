@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Decode the RTL's simulated pads with the stock sigrok protocol decoders and compare what they
+read with what each test sent and received.
+
+The lockstep tests (hw/test/test_lockstep.ml) write <name>.vcd (every pad, one sample per clock)
+and <name>.expect (the bytes the test itself sent and saw) when PEMU_VCD_DIR is set. This runs
+sigrok-cli on each VCD and checks the decoded bytes against the .expect file.
+
+    scripts/sigrok_check.py <vcd dir> [--md table.md]
+"""
+import argparse
+import pathlib
+import re
+import subprocess
+import sys
+
+USB_PIDS = {"DATA0": 0xC3, "DATA1": 0x4B, "ACK": 0xD2, "NAK": 0x5A, "STALL": 0x1E,
+            "SETUP": 0x2D, "IN": 0x69, "OUT": 0xE1, "SOF": 0xA5}
+
+
+def last_hex(line):
+    # "55" (uart, spi) or "Data write: 5A" (i2c); other lines (i2c's bare "Write") carry no byte
+    m = re.search(r"(?:^|: )([0-9A-Fa-f]{2})$", line)
+    return [int(m.group(1), 16)] if m else []
+
+
+def usb_packet(line, key):
+    m = re.match(r"(\w+)(?: \[ ([0-9A-F ]*) \])?$", line)
+    if not m or m.group(1) not in USB_PIDS:
+        return []
+    if key == "pids":
+        return [USB_PIDS[m.group(1)]]
+    return [int(b, 16) for b in (m.group(2) or "").split()]
+
+
+def rgb_to_grb(line):
+    v = line.strip().lstrip("#")
+    r, g, b = int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16)
+    return [g, r, b]
+
+
+def onewire(line, key):
+    if key == "write" and line.startswith("ROM command:"):
+        return [int(line.split()[2], 16)]
+    if key == "read" and line.startswith("ROM:"):
+        rom = int(line.split()[1], 16)
+        return [(rom >> (8 * k)) & 0xFF for k in range(8)]
+    return []
+
+
+def spi(clk, mosi, cs, miso, mode):
+    return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
+
+
+# name: (decoder stack, [(key in .expect, annotation selector, line -> values)])
+I2C = [("addr_w", "i2c=address-write", last_hex), ("data_w", "i2c=data-write", last_hex),
+       ("addr_r", "i2c=address-read", last_hex), ("data_r", "i2c=data-read", last_hex)]
+USB = ["usb_signalling:dp=uio4:dm=uio5:signalling=low-speed", "usb_packet"]
+CASES = {
+    "uart_loopback": (["uart:rx=uo0:baudrate=5000000"], [("tx", "uart=rx-data", last_hex)]),
+    **{f"spi_master_mode{m}": (spi("uo1", "uo2", "uo3", "ui4", m),
+                               [("mosi", "spi=mosi-data", last_hex),
+                                ("miso", "spi=miso-data", last_hex)]) for m in range(4)},
+    "spi_target": (spi("ui5", "ui6", "ui7", "uio0", 3),
+                   [("mosi", "spi=mosi-data", last_hex), ("miso", "spi=miso-data", last_hex)]),
+    "i2c_master": (["i2c:scl=uio0:sda=uio1"], I2C),
+    "i2c_target": (["i2c:scl=uio0:sda=uio1"], I2C),
+    "onewire": (["onewire_link:owr=uio2", "onewire_network"],
+                [(k, "onewire_network", lambda l, k=k: onewire(l, k)) for k in ("write", "read")]),
+    "ws2812": (["rgb_led_ws281x:din=uo0"], [("grb", "rgb_led_ws281x=rgb", rgb_to_grb)]),
+    "usb_tx": (USB, [(k, "usb_packet=packet", lambda l, k=k: usb_packet(l, k))
+                     for k in ("pids", "data")]),
+    "usb_rx": (USB, [(k, "usb_packet=packet", lambda l, k=k: usb_packet(l, k))
+                     for k in ("pids", "data")]),
+}
+
+
+def decode(vcd, stack, selector):
+    cmd = ["sigrok-cli", "-I", "vcd", "-i", str(vcd), "-P", ",".join(stack), "-A", selector]
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    return [l.split(": ", 1)[1] for l in out.splitlines() if ": " in l]
+
+
+def hexes(vs):
+    return " ".join(f"{v:02x}" for v in vs)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("dir", type=pathlib.Path)
+    ap.add_argument("--md", type=pathlib.Path)
+    a = ap.parse_args()
+    rows, bad = [], 0
+    for name, (stack, checks) in CASES.items():
+        vcd, exp = a.dir / f"{name}.vcd", a.dir / f"{name}.expect"
+        if not vcd.exists():
+            rows.append((name, "-", "-", "-", "NO VCD"))
+            bad += 1
+            continue
+        want = dict((l.split()[0], [int(x, 16) for x in l.split()[1:]])
+                    for l in exp.read_text().splitlines() if l.strip())
+        for key, selector, parse in checks:
+            got = [v for line in decode(vcd, stack, selector) for v in parse(line)]
+            ok = got == want.get(key)
+            bad += not ok
+            rows.append((name, stack[-1].split(":")[0], key, hexes(want.get(key, [])),
+                         "agree" if ok else f"DIFFERS: sigrok read {hexes(got)}"))
+    table = ["| test | decoder | field | the test's own data | sigrok |",
+             "|---|---|---|---|---|"] + [f"| {' | '.join(r)} |" for r in rows]
+    print("\n".join(table))
+    if a.md:
+        a.md.write_text("\n".join(table) + "\n")
+    print(f"\n{len(rows) - bad} of {len(rows)} fields agree")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
