@@ -65,9 +65,15 @@
 
   "//": "CLOCK_PERIOD - Increase this in case you are getting setup time violations.",
   "//": "The value is in nanoseconds, so 20ns == 50MHz.",
-  "//": "The chip runs at 50 MHz. The flow checks setup at every corner, including the slow one",
-  "//": "(1.08 V, 125 C), so an 18 ns target leaves at least 2 ns to spare at 20 ns everywhere.",
-  "CLOCK_PERIOD": 18,
+  "//": "The chip runs at 50 MHz, and the flow checks setup at that clock at every corner,",
+  "//": "including the slow one (1.08 V, 125 C). Before routing the resizer only has wire",
+  "//": "estimates, and the slow corner came out up to 6 ns worse once routed, so it aims 5 ns",
+  "//": "tighter there and repairs again with the real wires after global routing.",
+  "CLOCK_PERIOD": 20,
+  "PL_RESIZER_SETUP_SLACK_MARGIN": 5,
+  "GRT_RESIZER_SETUP_SLACK_MARGIN": 1,
+  "RUN_POST_GRT_DESIGN_REPAIR": true,
+  "RUN_POST_GRT_RESIZER_TIMING": true,
 
   "//": "Map for area and leave timing to the resizer after placement. With LibreLane 3.1.0.dev4 the",
   "//": "default DELAY 4 strategy added about 11,000 buffers in synthesis (+34% area) and routing",
