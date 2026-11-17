@@ -64,6 +64,7 @@ module O = struct
     ; crc : 'a [@bits 32]
     ; bstat : 'a [@bits 4]
     ; be_enabled : 'a
+    ; tx_pin : 'a [@bits 5] (* TXCFG[9:5], for the proofs: the pin the bit engine drives *)
     ; prog_q : 'a [@bits 16] (* program word at the prog_addr of the cycle before *)
     ; dbg_stopped : 'a
     ; dbg_by_bp : 'a
@@ -711,6 +712,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   ; crc = crc.value
   ; bstat
   ; be_enabled = be_en.value
+  ; tx_pin = txcfg.:[9, 5]
   ; prog_q = instr
   ; dbg_stopped = dbg_stopped.value
   ; dbg_by_bp = dbg_by_bp.value
