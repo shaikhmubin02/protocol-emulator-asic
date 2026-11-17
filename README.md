@@ -48,6 +48,12 @@ separately in OCaml, and most of the testing compares the two:
 - Induction proofs on the generated Verilog (`formal/`, `scripts/prove.sh`): for any program,
   an engine never changes a pin it doesn't own, a stopped engine drives nothing, and the
   mailboxes never overflow.
+- A timing proof on the same Verilog (`formal/timing_props.sv`): every instruction takes
+  exactly the cycles the instruction set says, whatever the host, the pins and the other engines
+  do. One cycle for most instructions, 1 + n for a delay of n, and a wait moves on in the cycle
+  after it sees its pin. Apart from the debugger, nothing outside an engine can stall it, so a program's timing can be
+  worked out from the program alone. Five timing bugs planted on purpose (a host write that
+  pauses a delay, a delay one cycle too long, and so on) each make the proof fail.
 - cocotb tests in `test/` that drive the chip only through its pins, as the board will.
 
 ## Layout

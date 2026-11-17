@@ -140,7 +140,6 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   and dbg_by_bp = var 1
   and dbg_skip = var 1
   and busy = var 8
-  and busy_next = var 8
   and fails = var 16
   and z = var 1
   and c = var 1
@@ -350,11 +349,13 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
                      (mux2 (delay ==:. 0) pc1 pc.value)
                      (mux2 is_wait (mux2 complete pc1 pc.value) pc1))))))
   in
+  (* a delay always ends at pc + 1: the pc doesn't move while busy is counting, a host pc write
+     clears busy, and run low clears both. So there is no register for the return address. *)
   let next_pc_prog =
     mux2
       (halted.value |: stop_now)
       pc.value
-      (mux2 (busy.value <>:. 0) (mux2 (busy.value ==:. 1) busy_next.value pc.value) exec_next)
+      (mux2 (busy.value <>:. 0) (mux2 (busy.value ==:. 1) pc1 pc.value) exec_next)
   in
   assign next_pc (mux2 ~:run (zero 8) (mux2 host_pc i.host_data.:[7, 0] next_pc_prog));
   (* ---------- CSR read ---------- *)
@@ -638,7 +639,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
          ; sync2_uio <-- sync1_uio.value
          ; sync2_ui <-- sync1_ui.value
          ; when_ (go &: (busy.value <>:. 0)) [ busy <-- busy.value -:. 1 ]
-         ; when_ (exec &: has_delay &: (delay <>:. 0)) [ busy <-- delay; busy_next <-- pc1 ]
+         ; when_ (exec &: has_delay &: (delay <>:. 0)) [ busy <-- delay ]
          ; when_ (exec &: sys 1) [ halted <-- vdd ]
          ; when_ (exec &: is 6) [ sp <-- sp.value +:. 1 ]
          ; when_ (exec &: sys 2) [ sp <-- sp.value -:. 1 ]

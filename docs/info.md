@@ -6,7 +6,9 @@ This file is used to generate your project datasheet.
 
 The chip has four small engines. Each one is a processor built for talking to pins: every
 instruction takes a known number of clock cycles, so a program can produce or check a waveform
-down to the exact cycle. Each engine has its own 256-word program memory, eight 16-bit registers
+down to the exact cycle. This is proven on the generated Verilog for any program: one cycle per
+instruction, 1 + n for a delay of n, and nothing outside an engine (the host, the pins, the other
+engines) can stall it, unless the debugger is used to stop it. Each engine has its own 256-word program memory, eight 16-bit registers
 and a bit engine (baud generator, TX and RX shifters).
 
 Each engine also has an 8-element LUT fabric for bit-level coding such as bit stuffing or NRZI,
