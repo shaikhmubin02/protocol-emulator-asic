@@ -54,6 +54,21 @@ separately in OCaml, and most of the testing compares the two:
   after it sees its pin. Apart from the debugger, nothing outside an engine can stall it, so a program's timing can be
   worked out from the program alone. Five timing bugs planted on purpose (a host write that
   pauses a delay, a delay one cycle too long, and so on) each make the proof fail.
+  The same proof also covers: a PIN write reaches the engine's output register exactly one cycle
+  later (unless the bit engine is driving that pin), a pin changes only when the program or the
+  bit engine writes it, every kind of wait moves on exactly in the cycle after its condition
+  holds (or times out, which sets T), and a breakpoint stops its engine and every engine joined
+  to it in the same cycle.
+- A proof of the chip around the engines (`formal/chip_props.sv`), with each engine replaced by
+  outputs that can do anything: a pad is its owner's output register with nothing in between,
+  a pin has at most one owner, a breakpoint reaches the other engines in the same cycle, every
+  engine sees the same cycle counter, and a SIG in one engine is seen by all of them one cycle
+  later. Put together with the engine proof: a PIN write at cycle t is on the pad at t+1.
+  Each assertion also has a planted break that must make it fail, so none of them holds
+  vacuously.
+- An outside check: the protocol tests can record the RTL's pins as waveforms, and
+  `scripts/sigrok_check.sh` decodes them with the standard sigrok protocol decoders (UART, SPI,
+  I2C, 1-Wire, WS2812, USB). All 26 decoded fields agree with what the tests sent and received.
 - cocotb tests in `test/` that drive the chip only through its pins, as the board will.
 
 ## Layout
@@ -79,6 +94,10 @@ The Hardcaml tests (lockstep, protocols, SAT proofs):
 The induction proofs:
 
     bash scripts/prove.sh
+
+The sigrok check (needs `sigrok-cli`):
+
+    bash scripts/sigrok_check.sh
 
 The cocotb tests:
 
