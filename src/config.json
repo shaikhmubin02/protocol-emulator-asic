@@ -81,9 +81,11 @@
   "SYNTH_STRATEGY": "AREA 0",
 
   "//": "Hold slack margin - Increase them in case you are getting hold violations.",
-  "//": "Raised from 0.1 and 0.05: five paths into an SRAM address missed hold by up to 0.07 ns",
-  "//": "at the fast corner once the post-route repair was on.",
-  "PL_RESIZER_HOLD_SLACK_MARGIN": 0.2,
+  "//": "Five paths into an SRAM address missed hold by up to 0.07 ns at the fast corner once the",
+  "//": "post-route repair was on, so the post-global-route margin went from 0.05 to 0.15. Raising",
+  "//": "the placement margin to 0.2 as well added about 440 hold buffers and the detailed router",
+  "//": "could no longer clear its shorts, so that one is back at 0.1.",
+  "PL_RESIZER_HOLD_SLACK_MARGIN": 0.1,
   "GRT_RESIZER_HOLD_SLACK_MARGIN": 0.15,
 
   "//": "RUN_LINTER, LINTER_INCLUDE_PDK_MODELS - Disabling the linter is not recommended!",
