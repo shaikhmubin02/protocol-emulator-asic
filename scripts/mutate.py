@@ -101,13 +101,12 @@ def sh(cmd, cwd, timeout):
 
 
 def prepare():
-    if os.path.exists(WORK):
-        shutil.rmtree(WORK)
-    os.makedirs(WORK)
+    # copy the sources over any earlier copy (which may hold a half-run mutant), keeping its
+    # _build so dune only rebuilds what changed
     for d in ["hw", "formal", "scripts"]:
-        shutil.copytree(os.path.join(ROOT, d), os.path.join(WORK, d),
+        shutil.copytree(os.path.join(ROOT, d), os.path.join(WORK, d), dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("_build", "*.corrected"))
-    os.makedirs(os.path.join(WORK, "src"))
+    os.makedirs(os.path.join(WORK, "src"), exist_ok=True)
     rc, log = sh("dune build -j 1 2>&1 | tail -5", os.path.join(WORK, "hw"), 3600)
     if rc:
         sys.exit("original does not build:\n" + log)
@@ -121,16 +120,16 @@ def run_tests(hw):
                 os.remove(os.path.join(hw, "_build/default/test", c))
         rc, log = sh(f"{runner} -only-test {t} -source-tree-root . -diff-cmd -",
                      os.path.join(hw, "_build/default/test"), 1800)
+        # The runner can leave a .corrected file identical to the source even when every test
+        # passes, so a test only counts as failed if the file differs (or the runner fails).
         corrected = os.path.join(hw, "_build/default/test", t + ".corrected")
-        if rc or os.path.exists(corrected):
-            first = ""
-            if os.path.exists(corrected):
-                a = open(os.path.join(hw, "test", t)).read().splitlines()
-                b = open(corrected).read().splitlines()
-                new = [l.strip() for l in b if l not in set(a) and len(l.strip()) > 2]
-                first = next((l for l in new if re.search(r"differ|Mismatch|cycle|seed", l)),
-                             new[0] if new else "")
-            return t, (first or log.strip().splitlines()[-1:] or [""])[0][:160]
+        a = open(os.path.join(hw, "test", t)).read().splitlines()
+        b = open(corrected).read().splitlines() if os.path.exists(corrected) else a
+        if rc or a != b:
+            new = [l.strip() for l in b if l not in set(a) and len(l.strip()) > 2]
+            first = next((l for l in new if re.search(r"differ|Mismatch|cycle|seed", l)),
+                         new[0] if new else "")
+            return t, (first or log.strip().splitlines()[-1:] or ["runner failed"])[0][:160]
     return None, ""
 
 
@@ -165,6 +164,18 @@ def check_one(m):
         open(path, "w", newline="").write(orig)
 
 
+def host_free_gb():
+    """Free physical memory of the Windows host (WSL interop), or None if it can't be read."""
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"],
+            capture_output=True, text=True, timeout=60).stdout
+        return int(out.strip()) / 1024 / 1024
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["list", "run"])
@@ -172,7 +183,17 @@ def main():
     ap.add_argument("--sample", type=int)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out", default=os.path.join(WORK + "_results.jsonl"))
+    ap.add_argument("--baseline", action="store_true",
+                    help="run the unmutated source through the same checks (must survive)")
+    ap.add_argument("--min-free-gb", type=float, default=0,
+                    help="stop before a mutant if the host has less free memory than this")
     a = ap.parse_args()
+    if a.baseline:
+        prepare()
+        r = run_one({"id": 0, "file": FILES[0], "op": "none", "start": 0, "end": 0, "new": "",
+                     "line": 0, "text": "the unmutated source"})
+        print(f"baseline: {r['result']} {r.get('by', '')} {r.get('detail', '')} ({r['seconds']} s)")
+        return
     ms = mutants()
     if a.cmd == "list":
         for m in ms:
@@ -193,6 +214,10 @@ def main():
         prepare()
     with open(a.out, "a") as out:
         for m in todo:
+            free = host_free_gb()
+            if a.min_free_gb and free is not None and free < a.min_free_gb:
+                print(f"stopping: {free:.1f} GB free, below {a.min_free_gb} GB", flush=True)
+                return
             r = run_one(m)
             out.write(json.dumps(r) + "\n")
             out.flush()
