@@ -15,8 +15,24 @@ jobs:
 
       - name: Build GDS
         uses: TinyTapeout/tt-gds-action@ttihp27a
+        # stop before the 6 hour job limit so the step below can still keep the reports
+        timeout-minutes: 340
         with:
           pdk: ihp-sg13cmos5l
+
+      - name: Keep the flow reports of a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flow_reports
+          path: |
+            runs/wokwi/resolved.json
+            runs/wokwi/**/*.rpt
+            runs/wokwi/**/*.drc
+            runs/wokwi/**/*.csv
+            runs/wokwi/**/state_out.json
+          if-no-files-found: warn
+          retention-days: 30
 
   precheck:
     needs: gds
