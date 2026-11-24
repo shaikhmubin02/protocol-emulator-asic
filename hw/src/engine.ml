@@ -218,14 +218,8 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   (* ---------- fetch / decode ---------- *)
   let run = i.run in
   let next_pc = wire 8 in
-  let wait_hold = wire 1 in
   (* while stopped the SRAM sits on address 0 so that instruction 0 is ready when run goes high *)
-  let sram_addr =
-    mux2
-      wait_hold
-      pc.value
-      (mux2 run next_pc (mux2 (i.prog_we |: i.prog_re) i.prog_addr (zero 8)))
-  in
+  let sram_addr = mux2 run next_pc (mux2 (i.prog_we |: i.prog_re) i.prog_addr (zero 8)) in
   let instr =
     Sram.create sram_mode ~clock:i.clock ~addr:sram_addr ~din:i.prog_data ~wen:(i.prog_we &: ~:run)
   in
@@ -302,14 +296,14 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
       ]
   in
   let is_wait = sys 3 |: sys 4 |: sys 7 |: sys 8 |: is 10 in
-  (* [wait_ready] is the last signal to settle in the cycle (it can depend on the instruction just
-     read from the SRAM, a register picked by it and a 16-bit compare), so it goes through one mux
-     here rather than to the bottom of a chain of four *)
   let ready =
     mux2
-      (sys 3 |: sys 4 |: sys 7 |: sys 8)
-      (mux2 (sys 3) outbox_room (mux2 (sys 4) inbox_has (mux2 (sys 7) ~:(hold_v.value) rx_ready.value)))
-      wait_ready
+      (sys 3)
+      outbox_room
+      (mux2
+         (sys 4)
+         inbox_has
+         (mux2 (sys 7) ~:(hold_v.value) (mux2 (sys 8) rx_ready.value wait_ready)))
   in
   let tmo = csr_value Isa.Csr.tmo in
   let timeout = (tmo <>:. 0) &: (uresize fails.value ~width:17 +:. 1 >=: uresize tmo ~width:17) in
@@ -354,7 +348,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
                   (mux2
                      has_delay
                      (mux2 (delay ==:. 0) pc1 pc.value)
-                     pc1)))))
+                     (mux2 is_wait (mux2 complete pc1 pc.value) pc1))))))
   in
   (* a delay always ends at pc + 1: the pc doesn't move while busy is counting, a host pc write
      clears busy, and run low clears both. So there is no register for the return address. *)
@@ -365,14 +359,6 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
       (mux2 (busy.value <>:. 0) (mux2 (busy.value ==:. 1) pc1 pc.value) exec_next)
   in
   assign next_pc (mux2 ~:run (zero 8) (mux2 host_pc i.host_data.:[7, 0] next_pc_prog));
-  (* [exec_next] and [next_pc] above take every wait as finished (pc + 1). A wait that has not
-     finished keeps the pc instead, and that is decided by [complete], the last signal of the
-     cycle, so it picks the pc at the very end: one mux before the pc register and the SRAM
-     address rather than the whole next-pc chain *)
-  let wait_pending =
-    ~:(halted.value |: stop_now) &: (busy.value ==:. 0) &: is_wait &: ~:complete
-  in
-  assign wait_hold (run &: ~:host_pc &: wait_pending);
   (* ---------- CSR read ---------- *)
   let caddr = f 5 0 in
   let bstat =
@@ -650,7 +636,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
   in
   compile
     (List.concat
-       [ [ pc <-- mux2 wait_hold pc.value next_pc
+       [ [ pc <-- next_pc
          ; sync1_uio <-- i.uio_in
          ; sync1_ui <-- i.ui_in
          ; sync2_uio <-- sync1_uio.value
@@ -690,7 +676,7 @@ let create ?(lite = false) (mode : Mode.t) (i : _ I.t) : _ O.t =
               ; if_
                   i.dbg_step
                   [ dbg_skip <-- vdd ]
-                  [ when_ (~:wait_pending &: (next_pc_prog <>: pc.value)) [ dbg_skip <-- gnd ] ]
+                  [ when_ (next_pc_prog <>: pc.value) [ dbg_skip <-- gnd ] ]
               ])
          ]
        ; List.concat (List.init 15 ~f:per_pin)

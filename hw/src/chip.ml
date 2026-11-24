@@ -109,30 +109,12 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
   let outbox_count = Array.init n_engines ~f:(fun _ -> wire 2) in
   let owner_is q e = bit owners.(q).value 2 &: (owners.(q).value.:[1, 0] ==:. e) in
   let triggers = Array.init n_engines ~f:(fun _ -> wire 1) in
-  (* Each engine gets its own copy of the write registers, loaded in the same cycle as the
-     central ones, so the decode next to the engine starts from a flop placed there rather than
-     from one up to 1.5 mm away. A copy only loads for writes to its engine or chip-wide ones, so
-     the copies differ and synthesis keeps them apart. Same cycle, same values: nothing an engine
-     sees changes. *)
-  let local_write e =
-    let for_e = (addr.value.:[15, 14] ==:. e) |: (addr.value.:[13, 12] ==:. 3) in
-    let load = word_written &: for_e in
-    let wr_e = reg spec load -- sprintf "wr_e%d" e in
-    let addr_e = reg spec ~enable:load addr.value -- sprintf "wr_addr_e%d" e in
-    let data_e = reg spec ~enable:load shifted -- sprintf "wr_data_e%d" e in
-    wr_e, addr_e, data_e
-  in
+  (* region 3 offset 0x14: stop [3:0], resume [7:4], step [11:8], one bit per engine, all in the
+     same cycle *)
+  let dbg_cmd k e = w_global 0x14 &: bit wr_data.value ((4 * k) + e) in
   let engines =
     Array.init n_engines ~f:(fun e ->
-      let wr_e, wr_addr_e, wr_data_e = local_write e in
-      let w_engine = field wr_addr_e 15 14
-      and w_region = field wr_addr_e 13 12
-      and w_off = field wr_addr_e 11 0 in
-      let w_this = wr_e &: (w_engine ==:. e) in
-      let w_global k = wr_e &: (w_region ==:. 3) &: (w_off ==:. k) in
-      (* region 3 offset 0x14: stop [3:0], resume [7:4], step [11:8], one bit per engine. Every
-         copy loads a chip-wide write, so all engines act on it in the same cycle *)
-      let dbg_cmd k e = w_global 0x14 &: bit wr_data_e ((4 * k) + e) in
+      let w_this = wr.value &: (w_engine ==:. e) in
       let mailbox_room = reg spec (inbox_count.(e) <:. 2) in
       let r_this_region k = (r_engine ==:. e) &: (r_region ==:. k) in
       Engine_in_scope.hierarchical
@@ -146,16 +128,16 @@ let create ?(n_engines = n_engines) mode scope (i : _ I.t) : _ O.t =
         ; ui_in = i.ui_in
         ; owned = concat_lsb (List.init n_pins ~f:(fun q -> owner_is q e))
         ; host_wr = w_this &: (w_region ==:. 2) &: bit w_off 7 &: mailbox_room
-        ; host_data = wr_data_e
+        ; host_data = wr_data.value
         ; host_rd = (rise &: pop_pending.value &: (pop_engine.value ==:. e)) -- sprintf "host_rd%d" e
         ; prog_we = w_this &: (w_region ==:. 0)
         ; prog_re = selected &: reading &: r_this_region 0
-        ; prog_addr = mux2 wr_e w_off.:[7, 0] r_off.:[7, 0]
-        ; prog_data = wr_data_e
+        ; prog_addr = mux2 wr.value w_off.:[7, 0] r_off.:[7, 0]
+        ; prog_data = wr_data.value
         ; run = bit run.value e
         ; cfg_we = w_this &: (w_region ==:. 1) &: bit w_off 0
         ; cfg_addr = w_off.:[5, 1]
-        ; cfg_data = wr_data_e @: lo_half.value
+        ; cfg_data = wr_data.value @: lo_half.value
         ; time = time.value
         ; ev_flags = flags.value
         ; dbg_bp = bp_cfg.(e).value.:[7, 0]
