@@ -433,3 +433,55 @@ let%expect_test "hdlc_tx.s on one engine into hdlc_rx.s on another" =
     frame [3f 0c 39], FCS good
     |}]
 ;;
+
+(* ---- DALI (IEC 62386): forward frames through the fabric with the 10BASE-T Manchester
+   configuration, unchanged; backward frames sampled by the program. Te is 100 times shorter
+   than the real 416.7 us to keep the RTL simulation short; the recording is written with the
+   real timing (2000 ns a cycle), so the decoder sees real DALI. *)
+let%expect_test "dali.s: a control device against control gear written from IEC 62386" =
+  let te = 208 in
+  let ls = Lockstep.create ~fabric:(Bitstream.eth_tx ~n_le:Model.n_le) (load "dali.s") in
+  Lockstep.record ls ~ns_per_cycle:2000. "dali";
+  let gear = Dali_gear.create ~te ~address:5 in
+  let frames =
+    [ 0x0A80, "level 0x80 to gear 5"
+    ; 0x0BA0, "query actual level, gear 5"
+    ; 0x0DA0, "query actual level, gear 6 (there is none)"
+    ; 0xFF05, "broadcast recall max level"
+    ; 0xFFA0, "broadcast query actual level"
+    ; 0x0B91, "query control gear present, gear 5"
+    ; 0xFF00, "broadcast off"
+    ; 0x0B90, "query status, gear 5"
+    ]
+  in
+  let pending = Queue.of_list (te :: List.map frames ~f:fst) in
+  let replies = ref [] in
+  let chip_tx () = if bit (Lockstep.uio_oe ls) 0 = 1 then bit (Lockstep.uio_out ls) 0 else 1 in
+  for _ = 1 to 120_000 do
+    let c = ls.cycle in
+    let bus = chip_tx () land Dali_gear.drive gear ~cycle:c in
+    Dali_gear.observe gear ~cycle:c ~bus;
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = bus lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> replies := v :: !replies)
+  done;
+  List.iter2_exn frames (List.rev !replies) ~f:(fun (_, what) r ->
+    printf "%-44s -> %s\n" what
+      (if r = 0x100 then "no answer" else if r = 0x200 then "broken answer" else sprintf "answer %02x" r));
+  printf "gear saw %d forward frames, %d broken; level now %d\n"
+    (List.length gear.frames) gear.bad_frames gear.level;
+  Lockstep.note ls "data" (List.map frames ~f:(fun (w, _) -> w land 0xff));
+  Lockstep.note ls "reply" (List.filter (List.rev !replies) ~f:(fun r -> r < 0x100));
+  [%expect {|
+    level 0x80 to gear 5                         -> no answer
+    query actual level, gear 5                   -> answer 80
+    query actual level, gear 6 (there is none)   -> no answer
+    broadcast recall max level                   -> no answer
+    broadcast query actual level                 -> answer fe
+    query control gear present, gear 5           -> answer ff
+    broadcast off                                -> no answer
+    query status, gear 5                         -> answer 00
+    gear saw 8 forward frames, 0 broken; level now 0
+    |}]
+;;

@@ -71,6 +71,18 @@ def can_data():
     return parse
 
 
+def dali(line, key):
+    # "Arc Power Level: 128", "Command: 160 (Query Level)", "Reply: 128"
+    m = re.match(r"(Arc Power Level|Command|Reply): (\d+)", line)
+    if not m:
+        return []
+    if key == "data" and m.group(1) != "Reply":
+        return [int(m.group(2))]
+    if key == "reply" and m.group(1) == "Reply":
+        return [int(m.group(2))]
+    return []
+
+
 def spi(clk, mosi, cs, miso, mode):
     return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
 
@@ -100,6 +112,8 @@ CASES = {
                [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
     "can_tx": (["can:can_rx=ui3:nominal_bitrate=500000"],
                [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
+    "dali": (["dali:dali=ui3"],
+             [(k, "dali=address:command:reply", lambda l, k=k: dali(l, k)) for k in ("data", "reply")]),
 }
 
 

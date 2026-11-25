@@ -193,6 +193,11 @@ bit. TX ticks are not affected, so full duplex works.
   goes to the TX pin. Through the fabric, the bit is the fabric's ext0 input, the line element
   drives the pin, and a hold element at 1 keeps the bit for another tick (that is how a stuffed
   bit gets in). With nothing to send the pin shows TXCFG[11].
+  TXCFG starts at 0, so while the bit engine is on it drives pin 0 at level 0 on every tick: a
+  program that only receives should set TXCFG to pin 31 (no pad) with idle level 1.
+  With MSB first, the bit sent is picked by the word length in TXCFG at each tick, not the
+  length the word was loaded with; change the length only while the shifter is empty, or send
+  LSB first, where the order doesn't depend on it.
 - RX: each tick samples the RX pin. Without the fabric the sample is the bit. Through the fabric,
   the sample is ext1, the rx bit element gives the bit, and a drop element at 1 throws it away
   (that is how a stuffed bit gets out). After RXCFG[3:0] + 1 kept bits the word is ready.
