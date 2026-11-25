@@ -1,6 +1,6 @@
 (library
  (name pemu_test)
- (libraries core hardcaml hardcaml_verify pemu)
+ (libraries core hardcaml hardcaml_verify pemu pemu_post)
  (inline_tests
   (deps (glob_files ../firmware/*.s))
   (flags (-source-tree-root .)))

@@ -48,6 +48,29 @@ def onewire(line, key):
     return []
 
 
+def can_id(line):
+    # "Identifier: 291 (0x123)"
+    m = re.search(r"\(0x([0-9A-Fa-f]+)\)$", line)
+    return [int(m.group(1), 16)] if m and line.startswith("Identifier") else []
+
+
+def can_data():
+    """Data bytes, skipping what the decoder reports inside a remote frame. A CAN 2.0 remote
+    frame has a DLC but no data field; the stock decoder (can/pd.py) takes the data length from
+    the DLC alone and reads DLC bytes of whatever follows. Those are not data."""
+    remote = [False]
+
+    def parse(line):
+        if line.startswith("Start of frame"):
+            remote[0] = False
+        elif line.startswith("Remote transmission request"):
+            remote[0] = "remote frame" in line
+        elif line.startswith("Data byte") and not remote[0]:
+            return [int(line.rsplit("0x", 1)[1], 16)]
+        return []
+    return parse
+
+
 def spi(clk, mosi, cs, miso, mode):
     return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
 
@@ -72,6 +95,9 @@ CASES = {
                      for k in ("pids", "data")]),
     "usb_rx": (USB, [(k, "usb_packet=packet", lambda l, k=k: usb_packet(l, k))
                      for k in ("pids", "data")]),
+    # after the RTL freeze
+    "can_rx": (["can:can_rx=ui3:nominal_bitrate=500000"],
+               [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
 }
 
 

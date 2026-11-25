@@ -19,11 +19,14 @@ import subprocess
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FW = os.path.join(ROOT, "hw", "firmware")
 ASM = os.path.join(ROOT, "hw", "_build", "default", "bin", "asm.exe")
-MODEL_TESTS = ["test_protocols.ml", "test_targets.ml", "test_ethernet.ml"]
+# test_post.ml: the protocols written after the freeze; each test there runs the RTL in lockstep
+# with the model against a model of the other end, so it counts in both columns
+MODEL_TESTS = ["test_protocols.ml", "test_targets.ml", "test_ethernet.ml", "test_post.ml"]
+LOCKSTEP_TESTS = ["test_lockstep.ml", "test_post.ml"]
 DESIGNED_FOR = {"uart", "spi_master", "spi_target", "i2c_master", "i2c_target", "ws2812",
                 "onewire", "usb_tx", "usb_rx", "eth_tx", "eth_rx"}
 # test name fragments that mean "checked against limits from the specification"
-SPEC_WORDS = re.compile(r"spec timing|\+-1\.5%|ppm|jitter|tolerance|fastest|802\.3|written from", re.I)
+SPEC_WORDS = re.compile(r"spec timing|\+-1\.5%|ppm|jitter|tolerance|fastest|802\.3|written from|acknowledged", re.I)
 
 
 def read(path):
@@ -68,7 +71,7 @@ def main():
     for path in sorted(glob.glob(os.path.join(FW, "*.s"))):
         name = os.path.splitext(os.path.basename(path))[0]
         model = [t for f in MODEL_TESTS for t in tests_mentioning(os.path.join(ROOT, "hw", "test", f), name)]
-        lock = tests_mentioning(os.path.join(ROOT, "hw", "test", "test_lockstep.ml"), name)
+        lock = [t for f in LOCKSTEP_TESTS for t in tests_mentioning(os.path.join(ROOT, "hw", "test", f), name)]
         pins = sorted(set(re.findall(r"async def (test_\w+)\(dut\):(?:(?!async def).)*?" + re.escape(name), cocotb, re.S)))
         sig = [k for k in sig_keys if k == name or k.startswith(name + "_") or (name == "uart" and k.startswith("uart"))]
         rows.append({

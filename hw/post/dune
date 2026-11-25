@@ -1,0 +1,7 @@
+; Fabric configurations written after the RTL freeze (tag rtl-freeze-2026-11-26). They use the
+; same configuration format as hw/src/bitstream.ml and change nothing in the hardware.
+(library
+ (name pemu_post)
+ (libraries core pemu)
+ (preprocess
+  (pps ppx_jane)))
