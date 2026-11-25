@@ -616,3 +616,171 @@ let%expect_test "midi_out.s on one engine into midi_in.s on another" =
       message 80 40 00
     |}]
 ;;
+
+(* ---- DMX512 (ANSI E1.11): 250 kbit/s, breaks and MABs, start codes, a fixture's footprint.
+   The other end is Dmx_node, written from the standard. *)
+let print_dmx_seen packets worst =
+  List.iter packets ~f:(fun (p : Dmx_node.seen) ->
+    match p.got with
+    | [] -> printf "break %d us, MAB %d us, no slots\n" (p.brk / Dmx_node.us) (p.mab / Dmx_node.us)
+    | sc :: data ->
+      printf "break %d us, MAB %d us, start code %02x, %d slots: %s%s%s\n" (p.brk / Dmx_node.us)
+        (p.mab / Dmx_node.us) sc (List.length data) (hex_bytes data)
+        (if p.period > 0 then sprintf " (a slot every %d us)" (p.period / Dmx_node.us) else "")
+        (if List.is_empty p.framing then "" else " FRAMING ERRORS"));
+  printf "largest edge distance from the 4 us grid: %d cycles\n" worst;
+  printf "E1.11 transmitter timing (break >= 92 us, MAB >= 12 us): %s\n"
+    (if List.for_all packets ~f:(fun p -> p.brk >= 92 * Dmx_node.us && p.mab >= 12 * Dmx_node.us)
+     then "met"
+     else "NOT MET")
+;;
+
+let dmx_tx_packets =
+  [ [ 0x00; 0x01; 0x02; 0x04; 0x08; 0x10; 0x20; 0x40; 0x80 ]
+  ; [ 0x17; 0x44; 0x4D; 0x58 ] (* a text packet (start code 0x17) *)
+  ; [ 0x00; 0xFF ]
+  ]
+;;
+
+let run_dmx_tx ?(name = "") ?(mark_bits = 0) ~break_bits ~mab_bits packets ~cycles =
+  let ls = Lockstep.create (load "dmx_tx.s") in
+  if not (String.is_empty name) then Lockstep.record ls ~ns_per_cycle:20. name;
+  let host = [ Dmx_node.bit; break_bits; mab_bits; mark_bits ] @ List.concat_map packets ~f:(fun p -> List.length p :: p) in
+  let pending = Queue.of_list host in
+  let samples = Array.create ~len:cycles 0 in
+  for c = 0 to cycles - 1 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    samples.(c) <- bit (Lockstep.uo ls) 0
+  done;
+  ls, samples
+;;
+
+let%expect_test "dmx_tx.s: packets checked by a receiver written from E1.11" =
+  (* a 4 us mark between slots here: sigrok's dmx512 decoder needs one (see sigrok_check.py) *)
+  let ls, samples =
+    run_dmx_tx ~name:"dmx_tx" ~mark_bits:1 ~break_bits:44 ~mab_bits:3 dmx_tx_packets ~cycles:80_000
+  in
+  let packets, worst = Dmx_node.read samples in
+  print_dmx_seen packets worst;
+  Lockstep.note ls "slots" (List.hd_exn dmx_tx_packets);
+  [%expect {|
+    break 176 us, MAB 12 us, start code 00, 8 slots: 01 02 04 08 10 20 40 80 (a slot every 48 us)
+    break 176 us, MAB 12 us, start code 17, 3 slots: 44 4d 58 (a slot every 48 us)
+    break 176 us, MAB 12 us, start code 00, 1 slots: ff (a slot every 48 us)
+    largest edge distance from the 4 us grid: 0 cycles
+    E1.11 transmitter timing (break >= 92 us, MAB >= 12 us): met
+    |}]
+;;
+
+let%expect_test "dmx_tx.s: the shortest break and MAB E1.11 lets a transmitter send" =
+  let _, samples = run_dmx_tx ~break_bits:23 ~mab_bits:3 [ [ 0x00; 0x5A ]; [ 0x00; 0xA5 ] ] ~cycles:24_000 in
+  let packets, worst = Dmx_node.read samples in
+  print_dmx_seen packets worst;
+  [%expect {|
+    break 92 us, MAB 12 us, start code 00, 1 slots: 5a (a slot every 44 us)
+    break 92 us, MAB 12 us, start code 00, 1 slots: a5 (a slot every 44 us)
+    largest edge distance from the 4 us grid: 0 cycles
+    E1.11 transmitter timing (break >= 92 us, MAB >= 12 us): met
+    |}]
+;;
+
+let print_dmx_words words =
+  List.iter words ~f:(fun w ->
+    if w < 0x100
+    then printf "  channel value %02x\n" w
+    else if w land 0xFF00 = 0x0100
+    then printf "  skipped a packet with start code %02x\n" (w land 0xff)
+    else if w land 0x8000 <> 0
+    then printf "  packet ended after %d slots, before the footprint did\n" (w land 0x3ff)
+    else if w land 0x4000 <> 0
+    then printf "  framing error in slot %d\n" (w land 0x3ff)
+    else if w = 0x2001
+    then printf "  low too short for a break\n"
+    else if w = 0x2002
+    then printf "  MAB too short\n"
+    else printf "  ? %04x\n" w)
+;;
+
+let run_dmx_rx ?(name = "") ~address ~footprint line =
+  let ls = Lockstep.create (load "dmx_rx.s") in
+  if not (String.is_empty name) then Lockstep.record ls ~ns_per_cycle:20. name;
+  let pending = Queue.of_list [ Dmx_node.bit; address; footprint ] in
+  let got = ref [] in
+  Array.iter line ~f:(fun level ->
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = level lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got));
+  ls, List.rev !got
+;;
+
+let%expect_test "dmx_rx.s: a fixture at address 3 with 4 channels, against a line from E1.11" =
+  let open Dmx_node in
+  let packets =
+    [ packet ~gap_us:4 [ 0x00; 0x11; 0x22; 0x33; 0x44; 0x55; 0x66; 0x77; 0x88 ]
+    ; packet [ 0xCC; 0x01; 0x10; 0x20; 0x30 ] (* an RDM start code *)
+    ; packet ~break_us:80 [ 0x00; 0xAA; 0xBB; 0xCC; 0xDD; 0xEE; 0xFF ] (* break too short *)
+    ; packet ~break_us:90 ~mab_us:6 [ 0x00; 0xAA; 0xBB; 0xCC; 0xDD ] (* MAB too short *)
+    ; packet ~break_us:90 ~mab_us:9 ~gap_us:20 [ 0x00; 0x01; 0x02; 0x03; 0x04; 0x05; 0x06 ]
+    ; packet [ 0x00; 0x07; 0x08; 0x09 ] (* ends before the footprint does *)
+    ; packet ~gap_us:20 ~bad_stop:4 [ 0x00; 0x10; 0x20; 0x30; 0x40; 0x50 ]
+    ; packet ~break_us:2000 [ 0x00; 0xA1; 0xA2; 0xA3; 0xA4; 0xA5; 0xA6; 0xA7; 0xA8 ]
+    ]
+  in
+  let ls, got = run_dmx_rx ~name:"dmx_rx" ~address:3 ~footprint:4 (line packets) in
+  print_dmx_words got;
+  Lockstep.note ls "slots" (List.hd_exn packets).slots;
+  [%expect {|
+    channel value 33
+    channel value 44
+    channel value 55
+    channel value 66
+    skipped a packet with start code cc
+    low too short for a break
+    MAB too short
+    channel value 03
+    channel value 04
+    channel value 05
+    channel value 06
+    channel value 09
+    packet ended after 4 slots, before the footprint did
+    channel value 30
+    framing error in slot 4
+    channel value a3
+    channel value a4
+    channel value a5
+    channel value a6
+    |}]
+;;
+
+let%expect_test "dmx_tx.s on one engine into dmx_rx.s on another" =
+  let tx = Lockstep.create (load "dmx_tx.s")
+  and rx = Lockstep.create (load "dmx_rx.s") in
+  let packets = [ [ 0x00; 0x10; 0x20; 0x30; 0x40 ]; [ 0x17; 0x44; 0x4D; 0x58 ]; [ 0x00; 0x01; 0x02; 0x03 ] ] in
+  let to_tx = Queue.of_list ([ Dmx_node.bit; 23; 3; 0 ] @ List.concat_map packets ~f:(fun p -> List.length p :: p))
+  and to_rx = Queue.of_list [ Dmx_node.bit; 1; 3 ] in
+  let got = ref [] in
+  for _ = 1 to 50_000 do
+    let send = Queue.peek to_tx in
+    let _, wrote = Lockstep.step ?send tx Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn to_tx : int);
+    let send = Queue.peek to_rx in
+    let read, wrote =
+      Lockstep.step ?send ~receive:true rx { Model.Pads.zero with ui_in = bit (Lockstep.uo tx) 0 lsl 3 }
+    in
+    if wrote then ignore (Queue.dequeue_exn to_rx : int);
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  print_dmx_words (List.rev !got);
+  [%expect {|
+    channel value 10
+    channel value 20
+    channel value 30
+    skipped a packet with start code 17
+    channel value 01
+    channel value 02
+    channel value 03
+    |}]
+;;

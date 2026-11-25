@@ -83,6 +83,28 @@ def dali(line, key):
     return []
 
 
+def dmx_first_packet():
+    """The slots of the first packet in a recording, start code first. Two limits of the stock
+    decoder (dmx512/pd.py) shape this. It only looks for a new break after channel 512: the break
+    after a shorter packet is read as one more slot with its stop bits low, and from there it has
+    lost its place. So the slots are read up to that first error, and the tests note the first
+    packet's slots. And it takes the level at the very end of the second stop bit as the mark
+    between slots: with slots back to back (E1.11 allows a mark of 0) that sample is already the
+    next start bit, so the recorded tests put a 4 us mark between slots. Back to back is checked
+    against the E1.11 model in the other DMX tests."""
+    done = [False]
+
+    def parse(line):
+        if done[0]:
+            return []
+        if line.startswith("Invalid"):
+            done[0] = True
+            return []
+        m = re.match(r"(\d+) / 0x", line)
+        return [int(m.group(1))] if m else []
+    return parse
+
+
 def spi(clk, mosi, cs, miso, mode):
     return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
 
@@ -114,6 +136,8 @@ CASES = {
                [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
     "midi_out": (["uart:rx=uo0:baudrate=31250"], [("bytes", "uart=rx-data", last_hex)]),
     "midi_in": (["uart:rx=ui3:baudrate=31250"], [("bytes", "uart=rx-data", last_hex)]),
+    "dmx_tx": (["dmx512:dmx=uo0"], [("slots", "dmx512=data:error", dmx_first_packet())]),
+    "dmx_rx": (["dmx512:dmx=ui3"], [("slots", "dmx512=data:error", dmx_first_packet())]),
     "dali": (["dali:dali=ui3"],
              [(k, "dali=address:command:reply", lambda l, k=k: dali(l, k)) for k in ("data", "reply")]),
 }
