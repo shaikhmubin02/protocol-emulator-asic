@@ -1367,3 +1367,124 @@ let%expect_test "jtag_host.s drives jtag_tap.s, and jtag_mon.s listens: three en
       DR scan, 16 bits: TDI beef, TDO 1234
     |}]
 ;;
+
+(* ---- SWD (ARM Debug Interface v5). The target is Swd_node, a SW-DP and a MEM-AP written from
+   the spec. *)
+let swd_raw n v = [ n - 1; v ]
+
+let swd_xfer ?(bad_parity = false) ?data ~ap ~reg () =
+  let rnw = if Option.is_none data then 1 else 0 in
+  (0x8000 lor ap lor (rnw lsl 1) lor (reg lsl 2) lor if bad_parity then 0x1000 else 0)
+  :: (match data with
+      | None -> []
+      | Some v -> [ v land 0xFFFF; v lsr 16 ])
+;;
+
+let swd_line_reset = List.concat (List.init 4 ~f:(fun _ -> swd_raw 16 0xFFFF))
+
+(* what the host asks, with a name for each transfer *)
+let swd_script =
+  let dp = swd_xfer ~ap:0
+  and ap = swd_xfer ~ap:1 in
+  [ None, swd_line_reset @ swd_raw 16 0xE79E @ swd_line_reset @ swd_raw 2 0
+  ; Some "DP read DPIDR", dp ~reg:0 ()
+  ; Some "DP write CTRL/STAT 50000000", dp ~reg:1 ~data:0x5000_0000 ()
+  ; Some "DP read CTRL/STAT", dp ~reg:1 ()
+  ; Some "DP write SELECT 000000f0", dp ~reg:2 ~data:0xF0 ()
+  ; Some "AP read IDR (posted)", ap ~reg:3 ()
+  ; Some "DP read RDBUFF", dp ~reg:3 ()
+  ; Some "DP write SELECT 00000000", dp ~reg:2 ~data:0 ()
+  ; Some "AP write CSW 23000012", ap ~reg:0 ~data:0x2300_0012 ()
+  ; Some "AP write TAR 20000000", ap ~reg:1 ~data:0x2000_0000 ()
+  ; Some "AP write DRW cafef00d", ap ~reg:3 ~data:0xCAFE_F00D ()
+  ; Some "AP write DRW 12345678", ap ~reg:3 ~data:0x1234_5678 ()
+  ; Some "AP write TAR 20000000", ap ~reg:1 ~data:0x2000_0000 ()
+  ; Some "AP read DRW (posted)", ap ~reg:3 ()
+  ; Some "AP read DRW (posted)", ap ~reg:3 ()
+  ; Some "DP read RDBUFF", dp ~reg:3 ()
+  ; Some "DP read DPIDR, parity bit sent wrong", swd_xfer ~bad_parity:true ~ap:0 ~reg:0 ()
+  ; None, swd_line_reset @ swd_raw 2 0
+  ; Some "DP read DPIDR after a line reset", dp ~reg:0 ()
+  ]
+;;
+
+let%expect_test "swd_host.s: a debug port and memory access port written from ADIv5" =
+  let ls = Lockstep.create (load "swd_host.s") in
+  Lockstep.record ls ~ns_per_cycle:20. "swd";
+  let target = Swd_node.create ~dpidr:0x2BA01477 ~ap_idr:0x24770011 ~memory:[] in
+  let pending = Queue.of_list (25 :: List.concat_map swd_script ~f:snd) in
+  let got = ref [] in
+  let both = ref 0 in
+  for _ = 0 to 80_000 do
+    let host_drives = bit (Lockstep.uio_oe ls) 0 = 1 in
+    if host_drives && Option.is_some target.drive then incr both;
+    let swdio =
+      if host_drives then bit (Lockstep.uio_out ls) 0 else Option.value target.drive ~default:1
+    in
+    Swd_node.step target ~swclk:(bit (Lockstep.uo ls) 0) ~swdio;
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with uio_in = swdio } in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  let ack = function
+    | 1 -> "OK"
+    | 2 -> "WAIT"
+    | 4 -> "FAULT"
+    | 7 -> "no answer"
+    | a -> sprintf "ack %d" a
+  in
+  let words = ref (List.rev !got) in
+  let take () =
+    match !words with
+    | w :: rest ->
+      words := rest;
+      w
+    | [] -> -1
+  in
+  List.iter swd_script ~f:(fun (name, cmd) ->
+    Option.iter name ~f:(fun what ->
+      let read = List.length cmd = 1 in
+      if read
+      then (
+        let lo = take () in
+        let hi = take () in
+        let s = take () in
+        printf "%-38s %s %08x%s\n" what (ack (s land 7)) ((hi lsl 16) lor lo)
+          (if s land 0x10 <> 0 then " PARITY WRONG" else ""))
+      else printf "%-38s %s\n" what (ack (take () land 7))));
+  printf "memory: %s\n"
+    (String.concat ~sep:" "
+       (List.map
+          (List.sort (Hashtbl.to_alist target.memory) ~compare:[%compare: int * int])
+          ~f:(fun (a, v) -> sprintf "%08x=%08x" a v)));
+  printf "the target noted: %s\n" (String.concat ~sep:"; " (List.rev target.log));
+  printf "cycles with both sides driving SWDIO: %d\n" !both;
+  Lockstep.note ls "acks" (List.init 15 ~f:(fun _ -> 1) @ [ 7; 1 ]);
+  Lockstep.note ls "data"
+    [ 0x2BA01477; 0x5000_0000; 0xF000_0000; 0xF0; 0; 0x24770011; 0; 0x2300_0012; 0x2000_0000
+    ; 0xCAFE_F00D; 0x1234_5678; 0x2000_0000; 0x24770011; 0xCAFE_F00D; 0x1234_5678; 0x2BA01477
+    ];
+  [%expect {|
+    DP read DPIDR                          OK 2ba01477
+    DP write CTRL/STAT 50000000            OK
+    DP read CTRL/STAT                      OK f0000000
+    DP write SELECT 000000f0               OK
+    AP read IDR (posted)                   OK 00000000
+    DP read RDBUFF                         OK 24770011
+    DP write SELECT 00000000               OK
+    AP write CSW 23000012                  OK
+    AP write TAR 20000000                  OK
+    AP write DRW cafef00d                  OK
+    AP write DRW 12345678                  OK
+    AP write TAR 20000000                  OK
+    AP read DRW (posted)                   OK 24770011
+    AP read DRW (posted)                   OK cafef00d
+    DP read RDBUFF                         OK 12345678
+    DP read DPIDR, parity bit sent wrong   no answer 00000000
+    DP read DPIDR after a line reset       OK 2ba01477
+    memory: 20000000=cafef00d 20000004=12345678
+    the target noted: line reset; line reset; DP read 0; DP write 1; DP read 1; DP write 2; AP read 3; DP read 3; DP write 2; AP write 0; AP write 1; AP write 3; AP write 3; AP write 1; AP read 3; AP read 3; DP read 3; request 85 not answered; line reset; DP read 0
+    cycles with both sides driving SWDIO: 0
+    |}]
+;;
