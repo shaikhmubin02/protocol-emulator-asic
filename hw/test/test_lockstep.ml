@@ -270,6 +270,45 @@ loop: pull r0
   [%expect {| 600 cycles in lockstep, 0 bytes left unsent |}]
 ;;
 
+(* The call stack is 4 deep and its pointer wraps, so at depth 4 the pointer is back on slot 0,
+   which still holds the first return address. Random programs and the firmware never go that
+   deep and come back, and a mutant that wrote the slot under the pointer on every instruction
+   survived because of it. Depth 4 must return all the way out; depth 5 must wrap the same way
+   in the RTL and the model (the documented behaviour: the oldest return address is lost). *)
+let%expect_test "call stack at full depth and past it, in lockstep" =
+  let run name depth =
+    let calls =
+      List.init depth ~f:(fun k ->
+        let d = k + 1 in
+        if d = depth
+        then sprintf "l%d:  ldi r%d, %d\n     ldi r6, 6\n     ldi r7, 7\n     ret\n" d d d
+        else sprintf "l%d:  ldi r%d, %d\n     call l%d\n     ldi r%d, 0x%d%d\n     ret\n" d d d (d + 1) d d d)
+      |> String.concat
+    in
+    let source = "     call l1\n     ldi r0, 0x55\nstop: jmp stop\n" ^ calls in
+    let program =
+      match Asm.assemble source with
+      | Ok w -> w
+      | Error e -> failwith e
+    in
+    let ls = Lockstep.create program in
+    for _ = 1 to 200 do
+      ignore (Lockstep.step ls Model.Pads.zero : int option * bool)
+    done;
+    let m = ls.model in
+    printf "%s: pc %d, r0..r5 = %s\n" name m.pc
+      (String.concat ~sep:" " (List.init 6 ~f:(fun k -> sprintf "%x" m.regs.(k))))
+  in
+  run "depth 4" 4;
+  run "depth 5" 5;
+  (* depth 4 comes all the way back to stop (pc 2, r0 set); depth 5 lost the first return
+     address, so it never reaches the top (r0 stays 0) and keeps cycling through levels 4..1 *)
+  [%expect {|
+    depth 4: pc 2, r0..r5 = 55 11 22 33 4 0
+    depth 5: pc 14, r0..r5 = 0 11 22 33 44 5
+    |}]
+;;
+
 let%expect_test "random programs on a lite engine (no fabric, no CRC)" =
   let programs = 150 in
   for seed = 1001 to 1000 + programs do
