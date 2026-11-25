@@ -152,3 +152,116 @@ let%expect_test "can_rx.s: CAN 2.0A frames received and acknowledged" =
       0555 0142 0000 0000 0000 0000
     |}]
 ;;
+
+(* ---- CAN 2.0A transmit: stuffing, CRC and bit timing in firmware (the fabric can't do CAN's
+   transmit-side stuffing). The other end is Can_node.Receiver, written from the specification;
+   it also measures each bus edge against the 100-cycle grid from the start of frame. *)
+let can_words (id, rtr, data) =
+  let rec pairs = function
+    | a :: b :: rest -> ((a lsl 8) lor b) :: pairs rest
+    | [ a ] -> [ a lsl 8 ]
+    | [] -> []
+  in
+  [ (id lor if rtr then 0x8000 else 0); List.length data ] @ if rtr then [] else pairs data
+;;
+
+(* run can_tx.s with [frames] queued by the host; [others] are extra transmitters started when the
+   chip's start of frame appears (for arbitration); returns the receiver and the chip's replies *)
+let run_can_tx ?(ack = true) ?(others = []) ~cycles name frames =
+  let ls = Lockstep.create (load "can_tx.s") in
+  Lockstep.record ls ~ns_per_cycle:20. name;
+  let rx = Can_node.Receiver.create ~bit_cycles:100 in
+  let pending = Queue.of_list (List.concat_map frames ~f:can_words) in
+  let replies = ref [] in
+  let others = ref others
+  and running = ref []
+  and last_bus = ref 1 in
+  let chip_tx () = if bit (Lockstep.uio_oe ls) 0 = 1 then bit (Lockstep.uio_out ls) 0 else 1 in
+  for _ = 1 to cycles do
+    let c = ls.cycle in
+    let theirs =
+      List.fold !running ~init:1 ~f:(fun acc (start, n) -> acc land Can_node.drive n ~cycle:(c - start))
+    in
+    let ack = if ack then Can_node.Receiver.drive rx ~cycle:c else 1 in
+    let bus = chip_tx () land theirs land ack in
+    (* a waiting transmitter hard-synchronises on the chip's start of frame and starts with it *)
+    if bus = 0 && !last_bus = 1
+    then (
+      match !others with
+      | f :: rest ->
+        running := (c, Can_node.create ~bit_cycles:100 f) :: !running;
+        others := rest
+      | [] -> ());
+    last_bus := bus;
+    Can_node.Receiver.observe rx ~cycle:c ~bus;
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = bus lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> replies := v :: !replies)
+  done;
+  ls, rx, List.rev !replies
+;;
+
+let print_received (rx : Can_node.Receiver.t) =
+  List.iter (List.rev rx.frames) ~f:(fun (g : Can_node.Receiver.got) ->
+    printf
+      "  received id %03x%s data [%s] CRC %s, stuff errors %d\n"
+      g.id
+      (if g.rtr then " (remote)" else "")
+      (String.concat ~sep:" " (List.map g.data ~f:(sprintf "%02x")))
+      (if g.crc_ok then "good" else "BAD")
+      g.stuff_errors)
+;;
+
+let%expect_test "can_tx.s: frames stuffed and timed by the program, checked by a receiver from the spec" =
+  let frames =
+    [ 0x123, false, [ 0xDE; 0xAD; 0xBE; 0xEF ]
+    ; 0x000, false, [ 0; 0; 0; 0; 0; 0; 0; 0 ]
+    ; 0x3FF, false, [ 0xFF; 0xFF; 0xFF ]
+    ; 0x0F0, false, [ 0x1F ]
+    ; 0x555, true, [ 0; 0 ]
+    ]
+  in
+  let ls, rx, replies = run_can_tx ~cycles:80_000 "can_tx" frames in
+  print_received rx;
+  printf "replies %s; largest edge distance from the 100-cycle grid: %d cycles\n"
+    (String.concat ~sep:" " (List.map replies ~f:Int.to_string))
+    rx.max_edge_error;
+  Lockstep.note ls "id" (List.map frames ~f:(fun (id, _, _) -> id));
+  Lockstep.note ls "data" (List.concat_map frames ~f:(fun (_, rtr, d) -> if rtr then [] else d));
+  [%expect {|
+      received id 123 data [de ad be ef] CRC good, stuff errors 0
+      received id 000 data [00 00 00 00 00 00 00 00] CRC good, stuff errors 0
+      received id 3ff data [ff ff ff] CRC good, stuff errors 0
+      received id 0f0 data [1f] CRC good, stuff errors 0
+      received id 555 (remote) data [] CRC good, stuff errors 0
+    replies 1 1 1 1 1; largest edge distance from the 100-cycle grid: 0 cycles
+    |}]
+;;
+
+let%expect_test "can_tx.s: nobody acknowledges" =
+  let _, rx, replies = run_can_tx ~ack:false ~cycles:20_000 "can_tx_noack" [ 0x321, false, [ 0x42 ] ] in
+  print_received rx;
+  printf "replies %s\n" (String.concat ~sep:" " (List.map replies ~f:Int.to_string));
+  [%expect {|
+      received id 321 data [42] CRC good, stuff errors 0
+    replies 2
+    |}]
+;;
+
+let%expect_test "can_tx.s: loses arbitration to a lower ID, then sends" =
+  (* the chip sends 0x456; another node starts on the chip's start of frame with 0x123, whose
+     identifier wins (a dominant bit where the chip sends recessive). The host then asks again. *)
+  let other = { Can_node.id = 0x123; rtr = false; data = [ 0xAA ]; flip = None } in
+  let _, rx, replies =
+    run_can_tx ~others:[ other ] ~cycles:40_000 "can_tx_arb"
+      [ 0x456, false, [ 0x11; 0x22 ]; 0x456, false, [ 0x11; 0x22 ] ]
+  in
+  print_received rx;
+  printf "replies %s\n" (String.concat ~sep:" " (List.map replies ~f:Int.to_string));
+  [%expect {|
+      received id 123 data [aa] CRC good, stuff errors 0
+      received id 456 data [11 22] CRC good, stuff errors 0
+    replies 3 1
+    |}]
+;;

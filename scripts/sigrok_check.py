@@ -98,6 +98,8 @@ CASES = {
     # after the RTL freeze
     "can_rx": (["can:can_rx=ui3:nominal_bitrate=500000"],
                [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
+    "can_tx": (["can:can_rx=ui3:nominal_bitrate=500000"],
+               [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
 }
 
 
