@@ -485,3 +485,134 @@ let%expect_test "dali.s: a control device against control gear written from IEC 
     gear saw 8 forward frames, 0 broken; level now 0
     |}]
 ;;
+
+(* ---- MIDI 1.0: 31250 baud 8N1 (1600 cycles a bit at 50 MHz), running status, real-time bytes.
+   The line model is the spec's: a start bit (0), 8 data bits LSB first, a stop bit (1). *)
+let midi_bit = 1600
+
+let midi_line bytes =
+  List.concat_map bytes ~f:(fun b -> (0 :: List.init 8 ~f:(fun k -> (b lsr k) land 1)) @ [ 1; 1 ])
+  |> Array.of_list
+;;
+
+(* bytes on a line, read the way a MIDI IN port does: wait for a start bit (a falling edge; the
+   pin is low for a few cycles at power-up, before the program drives it), sample mid-bit *)
+let midi_read samples =
+  let n = Array.length samples in
+  let rec go i acc =
+    if i >= n
+    then List.rev acc
+    else if i > 0 && samples.(i) = 0 && samples.(i - 1) = 1
+    then (
+      let at k = samples.(Int.min (n - 1) (i + (midi_bit / 2) + (k * midi_bit))) in
+      let byte = List.fold (List.init 8 ~f:(fun k -> k)) ~init:0 ~f:(fun a k -> a lor (at (k + 1) lsl k)) in
+      go (i + (10 * midi_bit) - (midi_bit / 2)) (byte :: acc))
+    else go (i + 1) acc
+  in
+  go 0 []
+;;
+
+let hex_bytes l = String.concat ~sep:" " (List.map l ~f:(sprintf "%02x"))
+
+let midi_out_messages =
+  [ [ 0x90; 0x643C ] (* note on, C4, velocity 100 *)
+  ; [ 0x90; 0x6440 ] (* same status: left out *)
+  ; [ 0xF8 ] (* timing clock *)
+  ; [ 0x90; 0x0040 ] (* note on with velocity 0 *)
+  ; [ 0xC5; 0x0010 ] (* program change, one data byte *)
+  ; [ 0x80; 0x003C ] (* note off *)
+  ; [ 0x80; 0x0040 ] (* same status: left out *)
+  ]
+;;
+
+let%expect_test "midi_out.s: running status, checked on the wire" =
+  let ls = Lockstep.create (load "midi_out.s") in
+  Lockstep.record ls ~ns_per_cycle:20. "midi_out";
+  let pending = Queue.of_list (List.concat midi_out_messages) in
+  let samples = ref [] in
+  for _ = 1 to 400_000 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    samples := bit (Lockstep.uo ls) 0 :: !samples
+  done;
+  let wire = midi_read (Array.of_list (List.rev !samples)) in
+  printf "on the wire: %s\n" (hex_bytes wire);
+  Lockstep.note ls "bytes" wire;
+  (* 90 3c 64, then 40 64 with the repeated 90 left out, f8 alone, 40 00 still under 90, then
+     c5 10, 80 3c 00, and 40 00 under 80 *)
+  [%expect {| on the wire: 90 3c 64 40 64 f8 40 00 c5 10 80 3c 00 40 00 |}]
+;;
+
+let midi_in_stream =
+  [ 0x90; 0x3C; 0x64 (* note on *)
+  ; 0x40; 0xF8; 0x64 (* running status, with a clock between its two data bytes *)
+  ; 0xC5; 0x10 (* program change *)
+  ; 0x11 (* running status for a one-byte message *)
+  ; 0xF0; 0x7E; 0xF7 (* a short system exclusive: ends the running status *)
+  ; 0x45 (* a data byte with no status before it *)
+  ]
+;;
+
+let print_midi_words words =
+  let rec go = function
+    | s :: d :: rest when s land 0x8000 <> 0 ->
+      printf "  message %02x %02x %02x\n" (s land 0xff) (d land 0xff) (d lsr 8);
+      go rest
+    | o :: rest ->
+      printf "  byte %02x\n" (o land 0xff);
+      go rest
+    | [] -> ()
+  in
+  go words
+;;
+
+let%expect_test "midi_in.s: whole messages from a byte stream" =
+  let ls = Lockstep.create (load "midi_in.s") in
+  Lockstep.record ls ~ns_per_cycle:20. "midi_in";
+  let line = midi_line midi_in_stream in
+  let got = ref [] in
+  for c = 0 to (Array.length line * midi_bit) + 20_000 do
+    let level = if c < 5000 then 1 else if (c - 5000) / midi_bit < Array.length line then line.((c - 5000) / midi_bit) else 1 in
+    let read, _ = Lockstep.step ~receive:true ls { Model.Pads.zero with ui_in = level lsl 3 } in
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  print_midi_words (List.rev !got);
+  Lockstep.note ls "bytes" midi_in_stream;
+  [%expect {|
+      message 90 3c 64
+      byte f8
+      message 90 40 64
+      message c5 10 00
+      message c5 11 00
+      byte f0
+      byte 7e
+      byte f7
+      byte 45
+    |}]
+;;
+
+let%expect_test "midi_out.s on one engine into midi_in.s on another" =
+  let tx = Lockstep.create (load "midi_out.s")
+  and rx = Lockstep.create (load "midi_in.s") in
+  let pending = Queue.of_list (List.concat midi_out_messages) in
+  let got = ref [] in
+  for _ = 1 to 400_000 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send tx Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    let line = bit (Lockstep.uo tx) 0 in
+    let read, _ = Lockstep.step ~receive:true rx { Model.Pads.zero with ui_in = line lsl 3 } in
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  print_midi_words (List.rev !got);
+  [%expect {|
+      message 90 3c 64
+      message 90 40 64
+      byte f8
+      message 90 40 00
+      message c5 10 00
+      message 80 3c 00
+      message 80 40 00
+    |}]
+;;

@@ -112,6 +112,8 @@ CASES = {
                [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
     "can_tx": (["can:can_rx=ui3:nominal_bitrate=500000"],
                [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
+    "midi_out": (["uart:rx=uo0:baudrate=31250"], [("bytes", "uart=rx-data", last_hex)]),
+    "midi_in": (["uart:rx=ui3:baudrate=31250"], [("bytes", "uart=rx-data", last_hex)]),
     "dali": (["dali:dali=ui3"],
              [(k, "dali=address:command:reply", lambda l, k=k: dali(l, k)) for k in ("data", "reply")]),
 }
@@ -131,11 +133,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir", type=pathlib.Path)
     ap.add_argument("--md", type=pathlib.Path)
+    ap.add_argument("--skip-missing", action="store_true",
+                    help="leave out cases with no recording (a run of one test file)")
     a = ap.parse_args()
     rows, bad = [], 0
     for name, (stack, checks) in CASES.items():
         vcd, exp = a.dir / f"{name}.vcd", a.dir / f"{name}.expect"
         if not vcd.exists():
+            if a.skip_missing:
+                continue
             rows.append((name, "-", "-", "-", "NO VCD"))
             bad += 1
             continue
