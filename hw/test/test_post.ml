@@ -265,3 +265,171 @@ let%expect_test "can_tx.s: loses arbitration to a lower ID, then sends" =
     replies 3 1
     |}]
 ;;
+
+(* ---- HDLC (RFC 1662 framing): stuffing in the fabric, FCS-16 in the CRC unit *)
+let%expect_test "HDLC transmit stuffing configuration, proved" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and d = G.input "d" 1
+  and flags = G.input "flags" 1 in
+  prove
+    ~words:(Pemu_post.Fabric_post.hdlc_tx ~n_le:8)
+    ~ext:G.(flags @: gnd @: d)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let open G in
+      let hold = q.(1) &: ~:flags in
+      let sent = d &: ~:hold in
+      let counting = ~:flags in
+      [ out.(0), hold (* five 1s went out: stuff a 0 *)
+      ; out.(7), sent (* the line *)
+      ; f.(5), sent &: counting
+      ; f.(4), sent &: q.(5) &: counting
+      ; f.(3), sent &: q.(4) &: counting
+      ; f.(2), sent &: q.(3) &: counting
+      ; f.(1), sent &: q.(2) &: counting
+      ; f.(6), gnd
+      ]);
+  [%expect {| proved: configuration = rule for all states and inputs |}]
+;;
+
+let%expect_test "HDLC receive configuration, proved" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and s = G.input "sample" 1 in
+  prove
+    ~words:(Pemu_post.Fabric_post.hdlc_rx ~n_le:8)
+    ~ext:G.(gnd @: s @: gnd)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let open G in
+      let five = q.(5) in
+      [ out.(0), s (* rx bit *)
+      ; f.(1), s
+      ; f.(2), s &: q.(1)
+      ; f.(3), s &: q.(2)
+      ; f.(4), s &: q.(3)
+      ; f.(5), s &: q.(4)
+      ; out.(6), five &: ~:s (* drop: the 0 after five 1s *)
+      ; out.(7), five &: s (* flag: a sixth 1 *)
+      ]);
+  [%expect {| proved: configuration = rule for all states and inputs |}]
+;;
+
+let hdlc_frames =
+  [ [ 0xFF; 0x03; 0xC0; 0x21; 0x01; 0x01; 0x00; 0x04 ] (* a PPP LCP configure-request header *)
+  ; [ 0xFF; 0xFF; 0xFF; 0xFF; 0xFF ] (* stuffing after every five bits *)
+  ; [ 0x7E; 0x7D; 0x7E ] (* bytes that look like flags *)
+  ; [ 0x3F ]
+  ]
+;;
+
+let%expect_test "hdlc_tx.s: frames checked by a receiver written from RFC 1662" =
+  let ls =
+    Lockstep.create
+      ~fabric:(Pemu_post.Fabric_post.hdlc_tx ~n_le:Model.n_le)
+      ~crc_poly:(0x1021 lsl 16)
+      ~crc_init:(0xFFFF lsl 16)
+      (load "hdlc_tx.s")
+  in
+  Lockstep.record ls ~ns_per_cycle:20. "hdlc_tx";
+  let rx = Hdlc_node.Receiver.create ~bit_cycles:200 in
+  let pending = Queue.of_list (List.concat_map hdlc_frames ~f:(fun f -> List.length f :: f)) in
+  let replies = ref 0 in
+  for _ = 1 to 90_000 do
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun _ -> incr replies);
+    Hdlc_node.Receiver.observe rx ~cycle:ls.cycle ~line:(bit (Lockstep.uo ls) 0)
+  done;
+  List.iter (List.rev rx.frames) ~f:(fun (g : Hdlc_node.Receiver.got) ->
+    printf "received [%s], FCS %s\n"
+      (String.concat ~sep:" " (List.map g.data ~f:(sprintf "%02x")))
+      (if g.fcs_ok then "good" else "BAD"));
+  printf "replies %d, host words left %d\n" !replies (Queue.length pending);
+  [%expect {|
+    received [ff 03 c0 21 01 01 00 04], FCS good
+    received [ff ff ff ff ff], FCS good
+    received [7e 7d 7e], FCS good
+    received [3f], FCS good
+    replies 4, host words left 0
+    |}]
+;;
+
+let%expect_test "hdlc_rx.s: frames from a sender written from RFC 1662" =
+  let ls =
+    Lockstep.create
+      ~fabric:(Pemu_post.Fabric_post.hdlc_rx ~n_le:Model.n_le)
+      ~crc_poly:(0x1021 lsl 16)
+      ~crc_init:(0xFFFF lsl 16)
+      (load "hdlc_rx.s")
+  in
+  Lockstep.record ls ~ns_per_cycle:20. "hdlc_rx";
+  let frames =
+    List.map hdlc_frames ~f:(fun bytes -> { Hdlc_node.bytes; bad_fcs = false; flags_before = 1 })
+    @ [ { bytes = [ 0x12; 0x34; 0x56 ]; bad_fcs = true; flags_before = 3 }
+      ; { bytes = [ 0xA5 ]; bad_fcs = false; flags_before = 0 } (* shares the previous closing flag *)
+      ]
+  in
+  let line = Array.of_list (Hdlc_node.stream ~idle:20 frames) in
+  let got = ref [] in
+  let n = Array.length line * 200 in
+  for c = 0 to n + 2000 do
+    let level = if c / 200 < Array.length line then line.(c / 200) else 1 in
+    let read, _ = Lockstep.step ~receive:true ls { Model.Pads.zero with ui_in = level lsl 3 } in
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  (* print each frame: its bytes, then the end word *)
+  let cur = ref [] in
+  List.iter (List.rev !got) ~f:(fun w ->
+    if w land 0x8000 <> 0
+    then (
+      printf "frame [%s] %d bytes, FCS %s\n"
+        (String.concat ~sep:" " (List.rev_map !cur ~f:(sprintf "%02x")))
+        (w land 0xff)
+        (if w land 0x4000 <> 0 then "good" else "BAD");
+      cur := [])
+    else cur := w :: !cur);
+  (* the FCS bytes (d1 b5 ...) are what RFC 1662's algorithm gives for each frame; the fifth frame's
+     FCS was broken on purpose, the sixth shares the fifth's closing flag *)
+  [%expect {|
+    frame [ff 03 c0 21 01 01 00 04 d1 b5] 10 bytes, FCS good
+    frame [ff ff ff ff ff b4 c9] 7 bytes, FCS good
+    frame [7e 7d 7e 4a 8c] 5 bytes, FCS good
+    frame [3f 0c 39] 3 bytes, FCS good
+    frame [12 34 56 90 11] 5 bytes, FCS BAD
+    frame [a5 df 02] 3 bytes, FCS good
+    |}]
+;;
+
+let%expect_test "hdlc_tx.s on one engine into hdlc_rx.s on another" =
+  let mk fabric name =
+    Lockstep.create ~fabric ~crc_poly:(0x1021 lsl 16) ~crc_init:(0xFFFF lsl 16) (load name)
+  in
+  let tx = mk (Pemu_post.Fabric_post.hdlc_tx ~n_le:Model.n_le) "hdlc_tx.s"
+  and rx = mk (Pemu_post.Fabric_post.hdlc_rx ~n_le:Model.n_le) "hdlc_rx.s" in
+  let pending = Queue.of_list (List.concat_map hdlc_frames ~f:(fun f -> List.length f :: f)) in
+  let got = ref [] in
+  for _ = 1 to 90_000 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ~receive:true tx Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    let line = bit (Lockstep.uo tx) 0 in
+    let read, _ = Lockstep.step ~receive:true rx { Model.Pads.zero with ui_in = line lsl 3 } in
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  let cur = ref [] in
+  List.iter (List.rev !got) ~f:(fun w ->
+    if w land 0x8000 <> 0
+    then (
+      printf "frame [%s], FCS %s\n"
+        (String.concat ~sep:" " (List.rev_map !cur ~f:(sprintf "%02x")))
+        (if w land 0x4000 <> 0 then "good" else "BAD");
+      cur := [])
+    else cur := w :: !cur);
+  [%expect {|
+    frame [ff 03 c0 21 01 01 00 04 d1 b5], FCS good
+    frame [ff ff ff ff ff b4 c9], FCS good
+    frame [7e 7d 7e 4a 8c], FCS good
+    frame [3f 0c 39], FCS good
+    |}]
+;;
