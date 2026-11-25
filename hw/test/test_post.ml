@@ -1108,3 +1108,262 @@ let%expect_test "lin_commander.s on one engine and lin_responder.s on another" =
       sync byte: 8 bits in 2084 cycles (260.50 a bit, +0.03% from ours); identifier 55
     |}]
 ;;
+
+(* ---- JTAG (IEEE 1149.1): a TAP, a controller and a passive monitor. The other ends are
+   Jtag_node, written from the standard. *)
+let tap_idcode = 0x1C0FFEE1
+let tap_ids = [ tap_idcode land 0xFFFF; tap_idcode lsr 16; 0x1234 ]
+
+(* a controller's moves as named pieces, so the TDO bits of each can be found afterwards *)
+let jtag_script =
+  let open Jtag_node in
+  [ None, reset
+  ; None, to_shift_dr
+  ; Some "IDCODE (32 bits)", shift ~n:32 0
+  ; None, to_idle
+  ; None, to_shift_ir
+  ; Some "IR capture, loading USER", shift ~n:4 user_ir
+  ; None, to_idle
+  ; None, to_shift_dr
+  ; Some "USER, writing beef", shift ~n:16 0xBEEF
+  ; None, to_idle
+  ; None, to_shift_dr
+  ; Some "USER, first 8 bits", shift ~n:8 0x00
+  ; None, tms [ 0; 0; 0; 1; 0 ] (* Pause-DR three ticks, Exit2-DR, back to Shift-DR *)
+  ; Some "USER, last 8 bits after a pause", shift ~n:8 0x00
+  ; None, to_idle
+  ; None, to_shift_ir
+  ; Some "IR capture, loading BYPASS", shift ~n:4 0b1111
+  ; None, to_idle
+  ; None, to_shift_dr
+  ; Some "BYPASS, shifting 10110011", shift ~n:8 0b10110011
+  ; None, to_idle
+  ; None, reset
+  ; None, to_shift_dr
+  ; Some "IDCODE again after a TMS reset", shift ~n:32 0
+  ; None, to_idle
+  ]
+;;
+
+let run_jtag_tap ?(record = false) ~half script =
+  let ls = Lockstep.create (load "jtag_tap.s") in
+  if record then Lockstep.record ls ~ns_per_cycle:20. "jtag_tap";
+  let ctl = Jtag_node.Controller.create ~half (List.concat_map script ~f:snd) in
+  let pending = Queue.of_list tap_ids in
+  let got = ref [] in
+  for c = 0 to 200 + Jtag_node.Controller.cycles ctl do
+    (* the controller starts once the program has its setup words *)
+    let cycle = c - 200 in
+    let tck, tms, tdi = if cycle < 0 then 0, 1, 0 else Jtag_node.Controller.levels ctl ~cycle in
+    let tdo = if bit (Lockstep.uio_oe ls) 0 = 1 then bit (Lockstep.uio_out ls) 0 else 1 in
+    if cycle >= 0 then Jtag_node.Controller.read_tdo ctl ~cycle ~tdo;
+    let send = Queue.peek pending in
+    let read, wrote =
+      Lockstep.step ?send ~receive:true ls
+        { Model.Pads.zero with ui_in = (tck lsl 4) lor (tms lsl 5) lor (tdi lsl 6) }
+    in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  (* the TDO bits of each named piece *)
+  let _, results =
+    List.fold script ~init:(0, []) ~f:(fun (pos, acc) (name, bits) ->
+      let n = List.length bits in
+      ( pos + n
+      , match name with
+        | None -> acc
+        | Some what -> (what, n, Jtag_node.value ctl.tdo ~from:pos ~n) :: acc ))
+  in
+  ls, List.rev results, List.rev !got
+;;
+
+let%expect_test "jtag_tap.s: found and used by a controller written from IEEE 1149.1, TCK 1 MHz" =
+  let _, results, words = run_jtag_tap ~half:25 jtag_script in
+  List.iter results ~f:(fun (what, n, v) -> printf "%-34s TDO %0*x\n" what ((n + 3) / 4) v);
+  printf "USER values the host was sent: %s\n" (String.concat ~sep:" " (List.map words ~f:(sprintf "%04x")));
+  [%expect {|
+    IDCODE (32 bits)                   TDO 1c0ffee1
+    IR capture, loading USER           TDO 1
+    USER, writing beef                 TDO 1234
+    USER, first 8 bits                 TDO ef
+    USER, last 8 bits after a pause    TDO be
+    IR capture, loading BYPASS         TDO 1
+    BYPASS, shifting 10110011          TDO 66
+    IDCODE again after a TMS reset     TDO 1c0ffee1
+    USER values the host was sent: beef 0000
+    |}]
+;;
+
+let%expect_test "jtag_tap.s: how fast TCK can go" =
+  let script = List.take jtag_script 4 in
+  List.iter [ 50; 25; 16; 12; 10; 8; 7; 6; 5 ] ~f:(fun half ->
+    let _, results, _ = run_jtag_tap ~half script in
+    let _, _, id = List.hd_exn results in
+    printf "TCK %.2f MHz (%d cycles high, %d low): IDCODE %08x %s\n"
+      (50. /. Float.of_int (2 * half)) half half id
+      (if id = tap_idcode then "right" else "WRONG"));
+  [%expect {|
+    TCK 0.50 MHz (50 cycles high, 50 low): IDCODE 1c0ffee1 right
+    TCK 1.00 MHz (25 cycles high, 25 low): IDCODE 1c0ffee1 right
+    TCK 1.56 MHz (16 cycles high, 16 low): IDCODE 1c0ffee1 right
+    TCK 2.08 MHz (12 cycles high, 12 low): IDCODE 1c0ffee1 right
+    TCK 2.50 MHz (10 cycles high, 10 low): IDCODE 1c0ffee1 right
+    TCK 3.12 MHz (8 cycles high, 8 low): IDCODE 1c0ffee1 right
+    TCK 3.57 MHz (7 cycles high, 7 low): IDCODE 1c0ffee1 right
+    TCK 4.17 MHz (6 cycles high, 6 low): IDCODE 381ffdc3 WRONG
+    TCK 5.00 MHz (5 cycles high, 5 low): IDCODE 03fff783 WRONG
+    |}]
+;;
+
+(* commands for jtag_host.s: a command word and a data word *)
+let jcmd ?(tms = false) ?(leave = false) ?(read = false) n data =
+  [ (n - 1) lor (if tms then 0x100 else 0) lor (if leave then 0x200 else 0) lor if read then 0x400 else 0
+  ; data
+  ]
+;;
+
+let jtag_host_script =
+  List.concat
+    [ jcmd ~tms:true 6 0b011111 (* reset, then Run-Test/Idle *)
+    ; jcmd ~tms:true 3 0b001 (* to Shift-DR *)
+    ; jcmd ~read:true 16 0
+    ; jcmd ~read:true 16 0
+    ; jcmd ~read:true 16 0
+    ; jcmd ~read:true ~leave:true 16 0 (* both IDCODEs, 64 bits *)
+    ; jcmd ~tms:true 2 0b01 (* Update-DR, Run-Test/Idle *)
+    ; jcmd ~tms:true 4 0b0011 (* to Shift-IR *)
+    ; jcmd ~read:true ~leave:true 8 0xFF (* both to BYPASS *)
+    ; jcmd ~tms:true 2 0b01
+    ; jcmd ~tms:true 3 0b001
+    ; jcmd ~read:true ~leave:true 16 0xA5C3 (* through two BYPASS bits *)
+    ; jcmd ~tms:true 2 0b01
+    ; jcmd ~tms:true 4 0b0011
+    ; jcmd ~read:true ~leave:true 8 0xF8 (* the TAP next to TDO: USER; the other: BYPASS *)
+    ; jcmd ~tms:true 2 0b01
+    ; jcmd ~tms:true 3 0b001
+    ; jcmd ~read:true 16 0xBEEF
+    ; jcmd ~read:true ~leave:true 1 0 (* 17 bits: USER, then the other TAP's BYPASS bit *)
+    ; jcmd ~tms:true 2 0b01
+    ]
+;;
+
+let%expect_test "jtag_host.s: a chain of two TAPs written from IEEE 1149.1" =
+  let ls = Lockstep.create (load "jtag_host.s") in
+  let near = Jtag_node.Tap.create ~idcode:0x0FACE00D ~user:0x5678
+  and far = Jtag_node.Tap.create ~idcode:tap_idcode ~user:0 in
+  (* TDI goes into [far] first; [near] drives TDO *)
+  let chain = Jtag_node.Chain.create [ far; near ] in
+  let pending = Queue.of_list (25 :: jtag_host_script) in
+  let got = ref [] in
+  for _ = 0 to 12_000 do
+    let uo = Lockstep.uo ls in
+    Jtag_node.Chain.step chain ~tck:(bit uo 0) ~tms:(bit uo 1) ~tdi:(bit uo 2);
+    let send = Queue.peek pending in
+    let read, wrote =
+      Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = Jtag_node.Chain.tdo chain lsl 3 }
+    in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  (match List.rev !got with
+   | [ a; b; c; d; ir1; byp; ir2; user; last ] ->
+     printf "IDCODEs, the TAP next to TDO first: %08x %08x\n" ((b lsl 16) lor a) ((d lsl 16) lor c);
+     printf "IR captures: %02x\n" ir1;
+     printf "a5c3 through the BYPASS bits came out as %04x: %d TAPs in the chain\n" byp
+       (List.find_exn [ 0; 1; 2; 3 ] ~f:(fun k -> (0xA5C3 lsl k) land 0xFFFF = byp));
+     printf "IR captures: %02x; USER read %04x, then the BYPASS bit %d\n" ir2 user last
+   | l -> printf "got %s\n" (String.concat ~sep:" " (List.map l ~f:(sprintf "%x"))));
+  printf "the TAP next to TDO: USER now %04x, written %d times\n" near.user (List.length near.updates);
+  [%expect {|
+    IDCODEs, the TAP next to TDO first: 0face00d 1c0ffee1
+    IR captures: 11
+    a5c3 through the BYPASS bits came out as 970c: 2 TAPs in the chain
+    IR captures: 11; USER read 5678, then the BYPASS bit 0
+    the TAP next to TDO: USER now beef, written 1 times
+    |}]
+;;
+
+let print_jtag_scans words =
+  let rec go acc = function
+    | w :: rest when w land 0x8000 <> 0 ->
+      let n = w land 0x3FFF in
+      let pairs = List.rev acc in
+      let value pick =
+        List.foldi pairs ~init:0 ~f:(fun i v (tdi, tdo) ->
+          let word = pick (tdi, tdo) in
+          let bits = if (i + 1) * 15 <= n then 15 else n - (i * 15) in
+          let word = if bits < 15 then word lsr (15 - bits) else word in
+          v lor (word lsl (15 * i)))
+      in
+      printf "  %s scan, %2d bits: TDI %0*x, TDO %0*x\n"
+        (if w land 0x4000 <> 0 then "IR" else "DR")
+        n
+        ((n + 3) / 4)
+        (value fst)
+        ((n + 3) / 4)
+        (value snd);
+      go [] rest
+    | tdi :: tdo :: rest -> go ((tdi, tdo) :: acc) rest
+    | _ -> ()
+  in
+  go [] words
+;;
+
+let%expect_test "jtag_host.s drives jtag_tap.s, and jtag_mon.s listens: three engines" =
+  let host = Lockstep.create (load "jtag_host.s")
+  and tap = Lockstep.create (load "jtag_tap.s")
+  and mon = Lockstep.create (load "jtag_mon.s") in
+  Lockstep.record mon ~ns_per_cycle:20. "jtag";
+  let script =
+    List.concat
+      [ jcmd ~tms:true 6 0b011111
+      ; jcmd ~tms:true 3 0b001
+      ; jcmd ~read:true 16 0
+      ; jcmd ~read:true ~leave:true 16 0
+      ; jcmd ~tms:true 2 0b01
+      ; jcmd ~tms:true 4 0b0011
+      ; jcmd ~read:true ~leave:true 4 0b1000
+      ; jcmd ~tms:true 2 0b01
+      ; jcmd ~tms:true 3 0b001
+      ; jcmd ~read:true ~leave:true 16 0xBEEF
+      ; jcmd ~tms:true 2 0b01
+      ]
+  in
+  let to_host = Queue.of_list (25 :: script)
+  and to_tap = Queue.of_list tap_ids in
+  let from_host = ref []
+  and from_tap = ref []
+  and from_mon = ref [] in
+  let step ls q acc pads =
+    let send = Option.bind q ~f:Queue.peek in
+    let read, wrote = Lockstep.step ?send ~receive:true ls pads in
+    if wrote then Option.iter q ~f:(fun q -> ignore (Queue.dequeue_exn q : int));
+    Option.iter read ~f:(fun v -> acc := v :: !acc)
+  in
+  for c = 0 to 10_000 do
+    let uo = Lockstep.uo host in
+    (* the controller waits for the TAP's setup words *)
+    let tck, tms, tdi = if c < 100 then 0, 1, 0 else bit uo 0, bit uo 1, bit uo 2 in
+    let tdo = if bit (Lockstep.uio_oe tap) 0 = 1 then bit (Lockstep.uio_out tap) 0 else 1 in
+    let jtag = (tck lsl 4) lor (tms lsl 5) lor (tdi lsl 6) in
+    step host (if c < 100 then None else Some to_host) from_host { Model.Pads.zero with ui_in = tdo lsl 3 };
+    step tap (Some to_tap) from_tap { Model.Pads.zero with ui_in = jtag };
+    step mon None from_mon { Model.Pads.zero with ui_in = jtag lor (tdo lsl 7) }
+  done;
+  printf "controller's host: %s\n" (String.concat ~sep:" " (List.rev_map !from_host ~f:(sprintf "%04x")));
+  printf "TAP's host (USER written): %s\n" (String.concat ~sep:" " (List.rev_map !from_tap ~f:(sprintf "%04x")));
+  printf "monitor's host:\n";
+  print_jtag_scans (List.rev !from_mon);
+  Lockstep.note mon "ir_tdi" [ 0b1000 ];
+  Lockstep.note mon "ir_tdo" [ 0b0001 ];
+  Lockstep.note mon "dr_tdi" [ 0; 0xBEEF ];
+  Lockstep.note mon "dr_tdo" [ tap_idcode; 0x1234 ];
+  [%expect {|
+    controller's host: fee1 1c0f 0001 1234
+    TAP's host (USER written): beef
+    monitor's host:
+      DR scan, 32 bits: TDI 00000000, TDO 1c0ffee1
+      IR scan,  4 bits: TDI 8, TDO 1
+      DR scan, 16 bits: TDI beef, TDO 1234
+    |}]
+;;
