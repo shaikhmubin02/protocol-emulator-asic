@@ -5,14 +5,15 @@
 # yet. The stripe pitch/spacing and the macro position are chosen so that some stripes sit
 # exactly on top of a power column of the same net. For those, this step adds Metal4 over the
 # column's pin shapes that touch the macro edge, joining the stripe stub to the SRAM.
-# Columns are covered where the macro declares a pin of the right net. Some columns are one net
-# in two pieces (VDD! over the periphery, VDDARRAY! over the array, both VPWR, with a gap between
-# them); once a stripe has joined such a column, the gap is bridged too, but only if no other
-# Metal4 shape of the macro lies in it. Without that, VDDARRAY! is only reached from below the
-# SRAM, and with no cell rows under the SRAM nothing powers it.
+# Columns are only covered where the macro declares a pin of the right net, never across gaps.
 #
 # It also drops the power pins the generator put on the short stubs, since tile power pins
 # must run the full height.
+#
+# Last, it removes the standard-cell rows under each SRAM (from the die edge up to the macro,
+# across its width plus the halo). The rails on those rows stay: they are what powers the stubs
+# below the SRAM, and through them the SRAM's VDDARRAY! columns, which only reach the bottom
+# edge. With no rows there, no cell is placed under an SRAM, so no wire has to cross one.
 #
 # Fails if a macro ends up without both a power and a ground connection.
 
@@ -54,47 +55,48 @@ def macro_power_shapes(inst, layer_name):
     return shapes
 
 
-def macro_layer_shapes(inst, layer_name):
-    """Every shape of the macro on one layer, pins of any net and obstructions, as absolute
-    (x0, y0, x1, y1), placed the same way as macro_power_shapes."""
-    bbox = inst.getBBox()
-    ox, oy = bbox.xMin(), bbox.yMin()
-    height = inst.getMaster().getHeight()
-    mirrored = str(inst.getOrient()) == "MX"
-    boxes = []
-    for mterm in inst.getMaster().getMTerms():
-        for mpin in mterm.getMPins():
-            boxes += list(mpin.getGeometry())
-    boxes += list(inst.getMaster().getObstructions())
-    out = []
-    for box in boxes:
-        if box.getTechLayer() is None or box.getTechLayer().getName() != layer_name:
-            continue
-        y0, y1 = box.yMin(), box.yMax()
-        if mirrored:
-            y0, y1 = height - y1, height - y0
-        out.append((box.xMin() + ox, y0 + oy, box.xMax() + ox, y1 + oy))
-    return out
+ROW_CUT_HALO_UM = 10.0  # same as FP_MACRO_HORIZONTAL_HALO
 
 
-def bridge_column_gaps(swire, layer, stripe, same_net, all_shapes, um):
-    """Bridge the gaps between consecutive pieces of one net in the column under a stripe.
-    A gap is only bridged if no shape of the macro on this layer overlaps it. Returns the count."""
-    x0, x1 = stripe.xMin(), stripe.xMax()
-    column = sorted((s for s in same_net if s[0] <= x0 and x1 <= s[2]), key=lambda s: s[1])
-    added = 0
-    for lo, hi in zip(column, column[1:]):
-        g0, g1 = lo[3], hi[1]
-        if g0 >= g1:
+def cut_rows_below(block, macros, halo):
+    """Remove the parts of standard-cell rows that lie wholly below a macro, across the macro's
+    width plus the halo. A row that crosses a cut keeps its sites on either side."""
+    cuts = [(m.getBBox().xMin() - halo, m.getBBox().xMax() + halo, m.getBBox().yMin()) for m in macros]
+    removed = kept = 0
+    for row in list(block.getRows()):
+        rb = row.getBBox()
+        spans = [(x0, x1) for x0, x1, ytop in cuts if rb.yMax() <= ytop and x0 < rb.xMax() and rb.xMin() < x1]
+        if not spans:
             continue
-        blocked = [s for s in all_shapes if s[0] < x1 and x0 < s[2] and s[1] < g1 and g0 < s[3]]
-        if blocked:
-            print(f"    gap y {um(g0):.3f}-{um(g1):.3f} not bridged: {len(blocked)} shape(s) in it")
-            continue
-        add_box(swire, layer, x0, g0, x1, g1)
-        added += 1
-        print(f"    -> bridged column gap y {um(g0):.3f}-{um(g1):.3f}")
-    return added
+        site = row.getSite()
+        step = row.getSpacing() or site.getWidth()
+        ox, oy = row.getOrigin()
+        n = row.getSiteCount()
+        # site indices [a, b) that stay
+        keep, start = [], 0
+        for x0, x1 in sorted(spans):
+            first_cut = max(0, (x0 - ox) // step)
+            last_cut = min(n, -(-(x1 - ox) // step))
+            if first_cut > start:
+                keep.append((start, first_cut))
+            start = max(start, last_cut)
+        if start < n:
+            keep.append((start, n))
+        name, orient, direction = row.getName(), row.getOrient(), row.getDirection()
+        odb.dbRow.destroy(row)
+        removed += 1
+        for k, (a, b) in enumerate(keep):
+            make_row(block, f"{name}_k{k}", site, ox + a * step, oy, orient, direction, b - a, step)
+            kept += 1
+    return removed, kept
+
+
+def make_row(*args):
+    create = getattr(odb, "dbRow_create", None) or odb.dbRow.create
+    row = create(*args)
+    if row is None:
+        raise SystemExit(f"could not create row {args[1]}")
+    return row
 
 
 def add_box(swire, layer, x0, y0, x1, y1):
@@ -123,10 +125,8 @@ def main(reader, layer_name):
             f"({um(bbox.xMin()):.3f}, {um(bbox.yMin()):.3f}) - ({um(bbox.xMax()):.3f}, {um(bbox.yMax()):.3f})"
         )
         shapes = macro_power_shapes(inst, layer_name)
-        all_shapes = macro_layer_shapes(inst, layer_name)
         print(f"  pin shapes on {layer_name}: " + ", ".join(f"{n}: {len(s)}" for n, s in shapes.items()))
         bridged = {"VPWR": 0, "VGND": 0}
-        gaps = 0
         for net_name in ("VPWR", "VGND"):
             net = block.findNet(net_name)
             if net is None:
@@ -147,7 +147,6 @@ def main(reader, layer_name):
                     )
                     if not (ends_below or starts_above):
                         continue
-                    joined_before = bridged[net_name]
                     for x0, y0, x1, y1 in shapes.get(net_name, []):
                         if not (x0 <= b.xMin() and b.xMax() <= x1):
                             continue
@@ -159,17 +158,23 @@ def main(reader, layer_name):
                             continue
                         bridged[net_name] += 1
                         print(f"    -> joined to pin shape y {um(y0):.3f}-{um(y1):.3f}")
-                    if bridged[net_name] > joined_before:
-                        gaps += bridge_column_gaps(
-                            swire, layer, b, shapes.get(net_name, []), all_shapes, um
-                        )
-        print(f"{inst.getName()}: bridges {bridged}, column gaps bridged {gaps}")
+        print(f"{inst.getName()}: bridges {bridged}")
         if bridged["VPWR"] == 0 or bridged["VGND"] == 0:
             print(f"ERROR: {inst.getName()} is not connected to both power nets", file=sys.stderr)
             failed = True
 
     if not macros:
         print("no SRAM macros found")
+    else:
+        removed, kept = cut_rows_below(block, macros, int(ROW_CUT_HALO_UM * dbu))
+        print(f"rows under the SRAMs: {removed} rows cut, {kept} pieces kept beside them")
+        for row in block.getRows():
+            rb = row.getBBox()
+            for m in macros:
+                mb = m.getBBox()
+                if rb.yMax() <= mb.yMin() and rb.xMin() < mb.xMax() and mb.xMin() < rb.xMax():
+                    print(f"ERROR: row {row.getName()} still runs under {m.getName()}", file=sys.stderr)
+                    failed = True
 
     # The power generator puts a pin on every stripe piece, including the short stubs it cut at
     # the SRAM. The tile rules want power pins that run (almost) the full height, so drop the

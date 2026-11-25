@@ -19,7 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 @Step.factory.register()
 class BridgeSramPower(OdbpyStep):
     id = "Pemu.BridgeSramPower"
-    name = "Connect SRAM power columns to the grid"
+    name = "Connect SRAM power columns to the grid; no cell rows under the SRAMs"
 
     def get_script_path(self):
         return os.path.join(HERE, "scripts", "bridge_sram_power.py")

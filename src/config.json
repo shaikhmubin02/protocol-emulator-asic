@@ -1,6 +1,6 @@
 {
   "//": "One SRAM per engine, in a row along the bottom, 400 um apart: 8 stripe pitches, so each one lines up with the stripes the same way. Mirrored (MX) so the signal pins, all on one edge, face up into the logic instead of the die edge.",
-  "//": "The row sits 11.34 um from the die edge: the rows under it are inside the 10 um macro halo, so no cells go below an SRAM. At 37.8 um the cells placed under SRAM 1 had to reach the logic over it, and the router left 65 shorts there with the SRAM power columns.",
+  "//": "The row sits 37.8 um from the die edge. The power grid is built with cell rows under the SRAMs, because their rails feed the stripe stubs that power VDDARRAY!, which only reaches the bottom edge. Pemu.BridgeSramPower then removes those rows, so no cell is placed under an SRAM: cells there had to reach the logic over SRAM 1, and the router left 65 shorts.",
   "//": "SRAM: the power stripes are placed so some land on the SRAM power columns; Pemu.BridgeSramPower joins them (see scripts/bridge_sram_power.py).",
   "meta": {
     "flow": "Classic",
@@ -11,10 +11,10 @@
   "MACROS": {
     "RM_IHPSG13_1P_256x16_c2_bm_bist": {
       "instances": {
-        "engine0.sram": { "location": [57.215, 11.34], "orientation": "MX" },
-        "engine1.sram": { "location": [457.215, 11.34], "orientation": "MX" },
-        "engine2.sram": { "location": [857.215, 11.34], "orientation": "MX" },
-        "engine3.sram": { "location": [1257.215, 11.34], "orientation": "MX" }
+        "engine0.sram": { "location": [57.215, 37.8], "orientation": "MX" },
+        "engine1.sram": { "location": [457.215, 37.8], "orientation": "MX" },
+        "engine2.sram": { "location": [857.215, 37.8], "orientation": "MX" },
+        "engine3.sram": { "location": [1257.215, 37.8], "orientation": "MX" }
       },
       "gds": ["dir::../macro/RM_IHPSG13_1P_256x16_c2_bm_bist/RM_IHPSG13_1P_256x16_c2_bm_bist.gds"],
       "lef": ["dir::../macro/RM_IHPSG13_1P_256x16_c2_bm_bist/RM_IHPSG13_1P_256x16_c2_bm_bist.lef"],
