@@ -784,3 +784,327 @@ let%expect_test "dmx_tx.s on one engine into dmx_rx.s on another" =
     channel value 03
     |}]
 ;;
+
+(* ---- LIN 2.2A (ISO 17987). Most LIN tests run 10 times faster than 19200 bit/s (a bit is
+   260 + 107/256 cycles) to keep the lockstep runs short, and are recorded at 200 ns a cycle so
+   the waveforms have the real timing; one test runs at the real rate. The other ends are
+   Lin_node, written from the standard. *)
+let lin_fast = 260, 107
+let lin_real = 2604, 43
+let bit_of (whole, frac) = Float.of_int whole +. (Float.of_int frac /. 256.)
+
+let lin_frame_word ~id ~len ~send ~classic =
+  id lor ((len - 1) lsl 8) lor (if send then 1 lsl 12 else 0) lor if classic then 1 lsl 13 else 0
+;;
+
+let lin_responder_table : int -> Lin_node.answer = function
+  | 0x10 -> Subscribe { length = 2; classic = false }
+  | 0x22 -> Publish { data = [ 0x11; 0x22; 0x33; 0x44 ]; classic = false; bad_checksum = false }
+  | 0x3C -> Subscribe { length = 8; classic = true }
+  | 0x3D ->
+    Publish { data = [ 0x7E; 0x06; 0xF2; 0x01; 0x02; 0x03; 0x04; 0xFF ]; classic = true; bad_checksum = false }
+  | 0x23 -> Publish { data = [ 0x55; 0xAA ]; classic = false; bad_checksum = true }
+  | _ -> Ignore
+;;
+
+(* the commander's schedule: (what, ID, data bytes, the commander sends them, classic checksum) *)
+let lin_schedule =
+  [ "commander sends 2 bytes", 0x10, [ 0x12; 0x34 ], true, false
+  ; "responder sends 4 bytes", 0x22, [], false, false
+  ; "master request (diagnostic, classic)", 0x3C, [ 0x7F; 0x06; 0xB2; 0x00; 0xFF; 0x7F; 0xFF; 0xFF ], true, true
+  ; "slave response (diagnostic, classic)", 0x3D, [], false, true
+  ; "responder sends a bad checksum", 0x23, [], false, false
+  ; "nobody answers", 0x15, [], false, false
+  ]
+;;
+
+let lin_lengths = function
+  | 0x22 -> 4
+  | 0x3D -> 8
+  | _ -> 2
+;;
+
+let print_lin_status s =
+  if s = 0x8000
+  then "ok"
+  else
+    String.concat ~sep:", "
+      (List.filter_map [ 1, "checksum wrong"; 2, "no response"; 4, "bit error" ] ~f:(fun (b, what) ->
+         if s land b <> 0 then Some what else None))
+;;
+
+let run_lin_commander ?name ?(schedule = lin_schedule) ~rate ~bits () =
+  let ls = Lockstep.create (load "lin_commander.s") in
+  Option.iter name ~f:(fun n -> Lockstep.record ls ~ns_per_cycle:(20. *. bit_of lin_real /. bit_of rate) n);
+  let responder = Lin_node.Responder.create ~bit:(bit_of rate) ~table:lin_responder_table in
+  let host =
+    [ fst rate; snd rate ]
+    @ List.concat_map schedule ~f:(fun (_, id, data, send, classic) ->
+      let len = if send then List.length data else lin_lengths id in
+      lin_frame_word ~id ~len ~send ~classic :: (if send then data else []))
+  in
+  let pending = Queue.of_list host in
+  let got = ref [] in
+  let bus_bits = ref [] in
+  let cycles = Float.iround_up_exn (bit_of rate *. Float.of_int bits) in
+  for c = 0 to cycles do
+    let chip_tx = if bit (Lockstep.uio_oe ls) 0 = 1 then bit (Lockstep.uio_out ls) 0 else 1 in
+    let bus = chip_tx land Lin_node.Responder.drive responder ~cycle:c in
+    Lin_node.Responder.observe responder ~cycle:c ~bus;
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = bus lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got);
+    bus_bits := bus :: !bus_bits
+  done;
+  (* the host's words, frame by frame: data bytes, then a status word *)
+  let rec frames words acc cur =
+    match words with
+    | [] -> List.rev acc
+    | w :: rest when w land 0x8000 <> 0 -> frames rest ((List.rev cur, w) :: acc) []
+    | w :: rest -> frames rest acc (w :: cur)
+  in
+  ls, frames (List.rev !got) [] [], responder
+;;
+
+let%expect_test "lin_commander.s: a schedule against a responder written from LIN 2.2A" =
+  (* about 560 bits of frames, and 65535 cycles of waiting for the frame nobody answers *)
+  let ls, results, responder = run_lin_commander ~name:"lin_commander" ~rate:lin_fast ~bits:820 () in
+  List.iter2_exn lin_schedule results ~f:(fun (what, id, _, _, _) (data, status) ->
+    printf "%02x %-38s %s%s\n" id what
+      (if List.is_empty data then "" else sprintf "read %s, " (hex_bytes data))
+      (print_lin_status status));
+  List.iter (List.rev responder.frames) ~f:(fun (id, data, good) ->
+    printf "responder got %02x: %s, checksum %s\n" id (hex_bytes data) (if good then "good" else "BAD"));
+  Lockstep.note ls "ids" (List.map lin_schedule ~f:(fun (_, id, _, _, _) -> id));
+  Lockstep.note ls "data"
+    (List.concat_map lin_schedule ~f:(fun (_, id, data, send, _) ->
+       if send
+       then data
+       else (
+         match lin_responder_table id with
+         | Publish p -> p.data
+         | _ -> [])));
+  Lockstep.note ls "invalid" [ 0x23 ];
+  [%expect {|
+    10 commander sends 2 bytes                ok
+    22 responder sends 4 bytes                read 11 22 33 44, ok
+    3c master request (diagnostic, classic)   ok
+    3d slave response (diagnostic, classic)   read 7e 06 f2 01 02 03 04 ff, ok
+    23 responder sends a bad checksum         read 55 aa, checksum wrong
+    15 nobody answers                         no response
+    responder got 10: 12 34, checksum good
+    responder got 3c: 7f 06 b2 00 ff 7f ff ff, checksum good
+    |}]
+;;
+
+let%expect_test "lin_commander.s at the real 19200 bit/s" =
+  let schedule = List.take lin_schedule 2 in
+  let _, results, responder = run_lin_commander ~schedule ~rate:lin_real ~bits:180 () in
+  List.iter2_exn schedule results ~f:(fun (what, id, _, _, _) (data, status) ->
+    printf "%02x %-38s %s%s\n" id what
+      (if List.is_empty data then "" else sprintf "read %s, " (hex_bytes data))
+      (print_lin_status status));
+  List.iter (List.rev responder.frames) ~f:(fun (id, data, good) ->
+    printf "responder got %02x: %s, checksum %s\n" id (hex_bytes data) (if good then "good" else "BAD"));
+  [%expect {|
+    10 commander sends 2 bytes                ok
+    22 responder sends 4 bytes                read 11 22 33 44, ok
+    responder got 10: 12 34, checksum good
+    |}]
+;;
+
+(* the commander side for lin_responder.s, from the spec: each frame gets a 150-bit slot at the
+   commander's own bit time; what it sends is fixed, what comes back is read off the bus *)
+let lin_header ?pid_byte ?(break_bits = 13) id = Lin_node.header ~break_bits ~pid_byte id
+
+let lin_sends ?(bad = false) ?(classic = false) id data =
+  lin_header id @ Lin_node.response ~bad_checksum:bad ~classic ~pid:(Lin_node.pid id) data
+;;
+
+let lin_host_answer id =
+  match id with
+  | 0x10 -> [ 2 ]
+  | 0x22 -> [ 0x104; 0x11; 0x22; 0x33; 0x44 ]
+  | 0x3D -> [ 0x308; 0x7E; 0x06; 0xF2; 0x01; 0x02; 0x03; 0x04; 0xFF ]
+  | _ -> [ 0 ]
+;;
+
+let run_lin_responder ?(record = false) ~bit_factor slots =
+  let ls = Lockstep.create (load "lin_responder.s") in
+  if record then Lockstep.record ls ~ns_per_cycle:(20. *. bit_of lin_real /. bit_of lin_fast) "lin_responder";
+  let cbit = bit_of lin_fast *. bit_factor in
+  let slot = 150. *. cbit
+  and first = 2000. in
+  let slots = Array.of_list (List.map slots ~f:Array.of_list) in
+  let start i = first +. (Float.of_int i *. slot) in
+  let commander c =
+    let i = Float.iround_down_exn ((Float.of_int c -. first) /. slot) in
+    if Float.(of_int c < first) || i >= Array.length slots
+    then 1
+    else (
+      let k = Float.iround_down_exn ((Float.of_int c -. start i) /. cbit) in
+      if k < Array.length slots.(i) then slots.(i).(k) else 1)
+  in
+  let rx = Lin_node.Rx.create ~bit:cbit in
+  let heard = ref [] in
+  let to_chip = Queue.of_list [ fst lin_fast ] in
+  let got = ref [] in
+  for c = 0 to Float.iround_up_exn (start (Array.length slots)) do
+    let chip_tx = if bit (Lockstep.uio_oe ls) 0 = 1 then bit (Lockstep.uio_out ls) 0 else 1 in
+    let bus = chip_tx land commander c in
+    Option.iter (Lin_node.Rx.step rx ~cycle:c ~bus) ~f:(fun (v, ok) -> heard := (c, v, ok) :: !heard);
+    let send = Queue.peek to_chip in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = bus lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn to_chip : int);
+    Option.iter read ~f:(fun v ->
+      got := v :: !got;
+      if v land 0xFF00 = 0x0100 then List.iter (lin_host_answer (v land 0x3F)) ~f:(Queue.enqueue to_chip))
+  done;
+  (* what the commander read in each slot after the header: the responder's bytes *)
+  let after_header i =
+    List.filter_map (List.rev !heard) ~f:(fun (c, v, _) ->
+      let c = Float.of_int c
+      and from = start i +. (Float.of_int (Array.length slots.(i)) *. cbit)
+      and until = start (i + 1) in
+      if Float.(c > from && c < until) then Some v else None)
+  in
+  ls, List.rev !got, after_header
+;;
+
+let print_lin_responder words ~nominal =
+  let rec go = function
+    | t8 :: code :: rest ->
+      let what =
+        if code land 0xFF00 = 0x0400
+        then "sync byte out of range"
+        else if code land 0xFF00 = 0x0200
+        then sprintf "identifier %02x: parity wrong" (code land 0xff)
+        else sprintf "identifier %02x" (code land 0xff)
+      in
+      printf "  sync byte: 8 bits in %d cycles (%.2f a bit, %+.2f%% from ours); %s" t8
+        (Float.of_int t8 /. 8.)
+        (100. *. ((Float.of_int t8 /. 8. /. nominal) -. 1.))
+        what;
+      let rec response acc = function
+        | s :: rest when s land 0x8000 <> 0 ->
+          printf ": %s%s\n"
+            (if List.is_empty acc then "" else sprintf "received %s, " (hex_bytes (List.rev acc)))
+            (print_lin_status s);
+          go rest
+        | d :: rest -> response (d :: acc) rest
+        | [] -> printf "\n"
+      in
+      if code land 0xFF00 = 0x0100 && List.hd_exn (lin_host_answer (code land 0x3F)) <> 0
+      then response [] rest
+      else (
+        printf "\n";
+        go rest)
+    | [ w ] -> printf "  ? %04x\n" w
+    | [] -> ()
+  in
+  go words
+;;
+
+let%expect_test "lin_responder.s: syncs to commanders with a bit time 12% short and 12% long" =
+  List.iter [ 0.88; 1.0; 1.12 ] ~f:(fun f ->
+    printf "commander's bit %.2f cycles:\n" (bit_of lin_fast *. f);
+    (* recorded at 12% slow: sigrok then reads the whole bus at the commander's 17143 bit/s *)
+    let ls, words, heard =
+      run_lin_responder ~record:Float.(f = 1.12) ~bit_factor:f
+        [ lin_sends 0x10 [ 0xA5; 0x5A ]; lin_header 0x22; lin_header 0x15 ]
+    in
+    Lockstep.note ls "ids" [ 0x10; 0x22; 0x15 ];
+    Lockstep.note ls "data" [ 0xA5; 0x5A; 0x11; 0x22; 0x33; 0x44 ];
+    Lockstep.note ls "invalid" [];
+    print_lin_responder words ~nominal:(bit_of lin_fast);
+    let r = heard 1 in
+    printf "  the commander read %s, checksum %s\n" (hex_bytes r)
+      (match List.rev r with
+       | c :: rd when List.length r = 5 ->
+         if Lin_node.checksum ~classic:false ~pid:(Lin_node.pid 0x22) (List.rev rd) = c then "good" else "BAD"
+       | _ -> "missing"));
+  [%expect {|
+    commander's bit 229.17 cycles:
+      sync byte: 8 bits in 1833 cycles (229.12 a bit, -12.02% from ours); identifier 50: received a5 5a, ok
+      sync byte: 8 bits in 1833 cycles (229.12 a bit, -12.02% from ours); identifier e2: ok
+      sync byte: 8 bits in 1834 cycles (229.25 a bit, -11.97% from ours); identifier 55
+      the commander read 11 22 33 44 72, checksum good
+    commander's bit 260.42 cycles:
+      sync byte: 8 bits in 2084 cycles (260.50 a bit, +0.03% from ours); identifier 50: received a5 5a, ok
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier e2: ok
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier 55
+      the commander read 11 22 33 44 72, checksum good
+    commander's bit 291.67 cycles:
+      sync byte: 8 bits in 2333 cycles (291.62 a bit, +11.98% from ours); identifier 50: received a5 5a, ok
+      sync byte: 8 bits in 2333 cycles (291.62 a bit, +11.98% from ours); identifier e2: ok
+      sync byte: 8 bits in 2334 cycles (291.75 a bit, +12.03% from ours); identifier 55
+      the commander read 11 22 33 44 72, checksum good
+    |}]
+;;
+
+let%expect_test "lin_responder.s: what it must ignore or report" =
+  let _, words, heard =
+    run_lin_responder ~bit_factor:1.0
+      [ lin_header 0x3D (* it sends 8 bytes with the classic checksum *)
+      ; lin_sends ~bad:true 0x10 [ 0x01; 0x02 ] (* a bad checksum *)
+      ; lin_header ~pid_byte:(Lin_node.pid 0x22 lxor 0x80) 0x22 (* a parity bit wrong *)
+      ; Lin_node.byte_bits 0x00 @ List.init 20 ~f:(fun _ -> 1) @ lin_header 0x15 (* a 0x00 byte, then a frame for nobody *)
+      ; lin_header ~break_bits:10 0x22 (* dominant for only 10 bits: not a break *)
+      ]
+  in
+  print_lin_responder words ~nominal:(bit_of lin_fast);
+  printf "the commander read in slot 0: %s\n" (hex_bytes (heard 0));
+  printf "the commander read in slot 4: %s\n" (hex_bytes (heard 4));
+  [%expect {|
+      sync byte: 8 bits in 2084 cycles (260.50 a bit, +0.03% from ours); identifier 7d: ok
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier 50: received 01 02, checksum wrong
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier 62: parity wrong
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier 55
+    the commander read in slot 0: 7e 06 f2 01 02 03 04 ff 7e
+    the commander read in slot 4:
+    |}]
+;;
+
+let%expect_test "lin_commander.s on one engine and lin_responder.s on another" =
+  let cmd = Lockstep.create (load "lin_commander.s")
+  and rsp = Lockstep.create (load "lin_responder.s") in
+  let schedule =
+    [ 0x10, [ 0x01; 0x02 ], true, false; 0x22, [], false, false; 0x3D, [], false, true; 0x15, [], false, false ]
+  in
+  let to_cmd =
+    Queue.of_list
+      ([ fst lin_fast; snd lin_fast ]
+       @ List.concat_map schedule ~f:(fun (id, data, send, classic) ->
+         let len = if send then List.length data else lin_lengths id in
+         lin_frame_word ~id ~len ~send ~classic :: data))
+  and to_rsp = Queue.of_list [ fst lin_fast ] in
+  let from_cmd = ref []
+  and from_rsp = ref [] in
+  let level ls = if bit (Lockstep.uio_oe ls) 0 = 1 then bit (Lockstep.uio_out ls) 0 else 1 in
+  for _ = 0 to 180_000 do
+    let bus = level cmd land level rsp in
+    let pads = { Model.Pads.zero with ui_in = bus lsl 3 } in
+    let send = Queue.peek to_cmd in
+    let read, wrote = Lockstep.step ?send ~receive:true cmd pads in
+    if wrote then ignore (Queue.dequeue_exn to_cmd : int);
+    Option.iter read ~f:(fun v -> from_cmd := v :: !from_cmd);
+    let send = Queue.peek to_rsp in
+    let read, wrote = Lockstep.step ?send ~receive:true rsp pads in
+    if wrote then ignore (Queue.dequeue_exn to_rsp : int);
+    Option.iter read ~f:(fun v ->
+      from_rsp := v :: !from_rsp;
+      if v land 0xFF00 = 0x0100 then List.iter (lin_host_answer (v land 0x3F)) ~f:(Queue.enqueue to_rsp))
+  done;
+  printf "commander's host: %s\n" (String.concat ~sep:" " (List.rev_map !from_cmd ~f:(sprintf "%x")));
+  printf "responder's host:\n";
+  print_lin_responder (List.rev !from_rsp) ~nominal:(bit_of lin_fast);
+  [%expect {|
+    commander's host: 8000 11 22 33 44 8000 7e 6 f2 1 2 3 4 ff 8000 8002
+    responder's host:
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier 50: received 01 02, ok
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier e2: ok
+      sync byte: 8 bits in 2083 cycles (260.38 a bit, -0.02% from ours); identifier 7d: ok
+      sync byte: 8 bits in 2084 cycles (260.50 a bit, +0.03% from ours); identifier 55
+    |}]
+;;
