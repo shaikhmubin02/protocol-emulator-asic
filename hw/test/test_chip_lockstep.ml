@@ -224,6 +224,59 @@ let%expect_test "whole chip against the chip model, random programs and host tra
     |}]
 ;;
 
+(* The host writes configuration (fabric words, CRC polynomial and start value) through SPI, and
+   reading it back gives 0, so the only way to see that a write landed is an engine using it.
+   Random programs rarely do, and a mutant that sent configuration writes to the wrong region
+   survived. Here engine 0 sends three bytes through the USB stuffing + NRZI configuration on
+   uo[0] with the CRC on, and the host reads the CRC back; pins and SPI are checked against the
+   chip model every cycle. *)
+let%expect_test "host-written fabric and CRC configuration reaches the engine" =
+  let t = H.create () in
+  ignore (attach ~seed:0 t : Chip_model.t);
+  let program =
+    Array.to_list
+      (Result.ok_or_failwith
+         (Asm.assemble
+            {|
+      ldi  r1, 0x07
+      ldih r1, 0x0d        ; txcfg: 8 bits, LSB first, pin 8, through the fabric, idle high
+      csrw txcfg, r1
+      ldi  r1, 0x0e
+      ldih r1, 0x02        ; fabctl: line = element 7, hold = element 0, hold on
+      csrw fabctl, r1
+      csrwi crcctl, 1      ; CRC on, fed by the TX bits
+      csrwi baud, 3
+      crci
+      ben  1
+      ldi  r0, 0xff
+      tx   r0
+      ldi  r0, 0x81
+      tx   r0
+      ldi  r0, 0x3f
+      tx   r0
+      dly  255
+      csrr r2, crc_lo
+      csrr r3, crc_hi
+      halt
+|}))
+  in
+  H.write t (H.program 0 0) program;
+  let fabric = Array.to_list (Bitstream.usb_tx ~n_le:Model.n_le) in
+  let words =
+    fabric @ List.init (16 - List.length fabric) ~f:(fun _ -> 0) @ [ 0x04C1_1DB7; 0xFFFF_FFFF ]
+  in
+  H.write t (H.config 0 ~word:0 ~half:0) (List.concat_map words ~f:(fun w -> [ w land 0xffff; w lsr 16 ]));
+  H.write t (H.owner 8) [ 4 ];
+  H.run t 1;
+  H.cycles t 800;
+  (match H.read t (H.reg 0 2) 2 with
+   | [ lo; hi ] -> printf "CRC after 3 bytes: %04x%04x\n" hi lo
+   | _ -> assert false);
+  (* the same CRC-32 computed outside the chip: shift left, xor the polynomial when the top bit
+     xor the data bit is 1, over FF 81 3F sent LSB first, from FFFFFFFF *)
+  [%expect {| CRC after 3 bytes: ec691b54 |}]
+;;
+
 let%expect_test "whole chip against the chip model, with random debug traffic" =
   let seeds = 16 in
   for seed = 1 to seeds do
