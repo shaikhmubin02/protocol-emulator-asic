@@ -55,6 +55,7 @@ from the repository root unless they say otherwise.
 | The protocols in `docs/post-freeze/results.md` work on the frozen RTL, each against a model of the other end written from its specification, with the RTL in lockstep with the model every cycle | `hw/test/test_post.ml`, `hw/test/test_post2.ml`, models in `hw/test/*_node.ml` | `cd hw && dune build @runtest` |
 | Each fabric configuration written after the freeze computes the rule it is meant to, for every state and input | SAT proofs with each protocol's tests | `cd hw && dune build @runtest` |
 | Outside decoders read the post-freeze protocols as my tests do | 32 of 32 fields agree (58 of 58 with the designed-for protocols); the decoder limits found on the way and how the check works around each are in `results.md` and `scripts/sigrok_check.py` | `bash scripts/sigrok_check.sh` (needs `sigrok-cli`) |
+| Unmodified Linux software works with the chip's RTL | the whole chip under Verilator, driven through its pins: OpenOCD scans `jtag_tap.s` and finds IDCODE 0x1c0ffee1, then writes and reads its USER register; mbpoll reads holding registers of `modbus.s`, writes one, and reads it back | `bash sim/demo_jtag.sh`, `bash sim/demo_modbus.sh` (need `verilator`, `openocd`, `mbpoll`) |
 
 ## What is not covered here
 

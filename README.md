@@ -36,6 +36,15 @@ Firmware in `hw/firmware`, each one tested against a model of the device on the 
 Each engine also has a small LUT fabric and a CRC unit for bit-level coding; USB and 10BASE-T
 use them, and any engine can run them.
 
+After the RTL freeze (tag `rtl-freeze-2026-11-26`) the hardware stays as it is, and new protocols
+are firmware and fabric configurations only: CAN 2.0 receive and transmit, HDLC, DALI, MIDI,
+DMX512, LIN with an auto-baud responder, a JTAG TAP, controller and monitor, an SWD host, S/PDIF
+transmit (biphase-mark, a coding the chip was not designed with, done in the fabric), NEC and
+RC-5 infrared, Wiegand, PS/2 keyboard and host, Modbus RTU, HDMI-CEC, and AX.25 packet radio
+(APRS) with Bell 202 audio on three engines. `docs/post-freeze/results.md` has each one next to
+the prediction I wrote before the freeze, what went wrong on the way, and the decoder limits
+found.
+
 Engines can be debugged on the chip over the host port: breakpoints, single cycle steps, and
 reading or changing registers while stopped. A breakpoint on one engine can stop the others in
 the same clock cycle, so the whole chip can be inspected at one moment of a protocol exchange.
@@ -75,8 +84,14 @@ separately in OCaml, and most of the testing compares the two:
   vacuously.
 - An outside check: the protocol tests can record the RTL's pins as waveforms, and
   `scripts/sigrok_check.sh` decodes them with the standard sigrok protocol decoders (UART, SPI,
-  I2C, 1-Wire, WS2812, USB). All 26 decoded fields agree with what the tests sent and received.
+  I2C, 1-Wire, WS2812, USB, and after the freeze CAN, MIDI, DMX512, LIN, JTAG, SWD, NEC, RC-5,
+  S/PDIF, Wiegand, PS/2, Modbus, CEC, DALI). All 58 decoded fields agree with what the tests
+  sent and received.
 - cocotb tests in `test/` that drive the chip only through its pins, as the board will.
+- Unmodified Linux software on the other end (`sim/`): the whole chip's RTL under Verilator,
+  driven through its pins. OpenOCD scans `jtag_tap.s` through its remote_bitbang driver and finds
+  the TAP's IDCODE, and mbpoll reads and writes holding registers of `modbus.s` through a
+  pseudo-terminal.
 
 ## Layout
 
@@ -84,6 +99,7 @@ separately in OCaml, and most of the testing compares the two:
 - `src/` - generated Verilog, plus the LibreLane config
 - `test/` - cocotb tests
 - `formal/` - property wrappers for the induction proofs
+- `sim/` - the chip under Verilator with Linux software on the other end
 - `docs/info.md` - Tiny Tapeout datasheet page
 - `scripts/` - setup and helper scripts
 
@@ -111,6 +127,11 @@ The cocotb tests:
     source ~/.venvs/asic/bin/activate
     cd test
     make
+
+The Linux demos (need `verilator`, `openocd` and `mbpoll`):
+
+    bash sim/demo_jtag.sh
+    bash sim/demo_modbus.sh
 
 Started from the Tiny Tapeout [ttihp-verilog-template](https://github.com/TinyTapeout/ttihp-verilog-template/tree/cmos5l).
 
