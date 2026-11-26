@@ -353,3 +353,120 @@ let%expect_test "modbus.s: a server, against a client written from the Modbus sp
     registers 0 to 5: 1000 1234 abcd ef01 1004 0007
     |}]
 ;;
+
+(* ---- HDMI-CEC, run 10 times faster than real time: a 50 us unit is 250 cycles, and the
+   recording is written at 200 ns a cycle, so it has the real timing. The device under test has
+   logical address 4 (a playback device); the other ends are Cec_node: a TV (address 0) that
+   sends frames and acknowledges frames to it, an audio system (5) that acknowledges frames to
+   it, and a listener that only reads the line. *)
+let cec_u = 250
+let cec_line ls = if bit (Lockstep.uio_oe ls) 0 = 1 then bit (Lockstep.uio_out ls) 0 else 1
+
+let run_cec ?(record = false) ~from_tv ~to_send ~cycles () =
+  let ls = Lockstep.create (load "cec.s") in
+  if record then Lockstep.record ls ~ns_per_cycle:(20. *. 10.) "cec";
+  let tv = Cec_node.initiator ~u:cec_u ~cycles from_tv in
+  let tv_acks = Cec_node.Follower.create ~u:cec_u ~address:0
+  and audio = Cec_node.Follower.create ~u:cec_u ~address:5
+  and listener = Cec_node.Follower.create ~u:cec_u ~address:(-1) in
+  let to_chip = Queue.of_list ([ cec_u; 4 ] @ to_send) in
+  let words = ref [] in
+  let bus = Array.create ~len:cycles 1 in
+  for c = 0 to cycles - 1 do
+    let b = tv.(c) land tv_acks.out land audio.out land cec_line ls in
+    bus.(c) <- b;
+    List.iter [ tv_acks; audio; listener ] ~f:(fun f -> Cec_node.Follower.step f ~cycle:c ~bus:b);
+    step ls to_chip words { Model.Pads.zero with uio_in = b }
+  done;
+  ls, List.rev !words, listener, bus
+;;
+
+let print_cec_words words =
+  List.iter words ~f:(fun w ->
+    if w land 0x8000 <> 0
+    then
+      printf "  sent: %s\n"
+        (match w land 0xFF with
+         | 0 -> "done"
+         | 1 -> "not acknowledged"
+         | 2 -> "lost arbitration"
+         | s -> sprintf "status %d" s)
+    else
+      printf "  read %02x%s%s\n" (w land 0xFF)
+        (if w land 0x400 <> 0 then ", acknowledged" else "")
+        (if w land 0x200 <> 0 then ", last block" else ""))
+;;
+
+let%expect_test "cec.s: frames from a TV model, some for it, written from the HDMI-CEC spec" =
+  let frames =
+    [ 10_000, [ 0x04 ] (* polling: is there a device 4? *)
+    ; 260_000, [ 0x04; 0x8F ] (* Give Device Power Status, to 4 *)
+    ; 630_000, [ 0x05; 0x8F ] (* the same, to the audio system *)
+    ; 1_000_000, [ 0x0F; 0x84; 0x10; 0x00; 0x00 ] (* broadcast: Report Physical Address *)
+    ; 1_730_000, [ 0x03; 0x8F ] (* to 3: nobody there *)
+    ]
+  in
+  let _, words, listener, _ = run_cec ~from_tv:frames ~to_send:[] ~cycles:2_100_000 () in
+  print_cec_words words;
+  printf "on the line: %s\n" (String.concat ~sep:" | " (List.rev_map listener.frames ~f:Cec_node.to_string));
+  [%expect {|
+      read 04, acknowledged, last block
+      read 04, acknowledged
+      read 8f, acknowledged, last block
+      read 05, acknowledged
+      read 8f, acknowledged, last block
+      read 0f
+      read 84
+      read 10
+      read 00
+      read 00, last block
+      read 03
+      read 8f, last block
+    on the line: 04a. | 04a 8fa. | 05a 8fa. | 0f 84 10 00 00. | 03 8f.
+    |}]
+;;
+
+let%expect_test "cec.s: sending for its host, checked on the line" =
+  let to_send = [ 3; 0x40; 0x90; 0x00 ] @ [ 1; 0x43 ] @ [ 4; 0x4F; 0x82; 0x10; 0x00 ] in
+  let ls, words, listener, bus = run_cec ~record:true ~from_tv:[] ~to_send ~cycles:1_400_000 () in
+  print_cec_words words;
+  printf "on the line: %s\n" (String.concat ~sep:" | " (List.rev_map listener.frames ~f:Cec_node.to_string));
+  (* every low stretch on the line, in ms at real time *)
+  let lows = ref []
+  and fell = ref 0 in
+  Array.iteri bus ~f:(fun i b ->
+    if i > 0 && b = 0 && bus.(i - 1) = 1 then fell := i;
+    if i > 0 && b = 1 && bus.(i - 1) = 0 then lows := (i - !fell) :: !lows);
+  let ms c = Float.of_int c /. Float.of_int cec_u *. 0.05 in
+  let kinds =
+    List.dedup_and_sort ~compare:Float.compare (List.map !lows ~f:(fun l -> Float.round_decimal (ms l) ~decimal_digits:2))
+  in
+  printf "low stretches on the line: %s ms\n" (String.concat ~sep:", " (List.map kinds ~f:(sprintf "%.2f")));
+  let starts = List.rev_map listener.starts ~f:fst in
+  printf "start bits at: %s ms\n" (String.concat ~sep:", " (List.map starts ~f:(fun c -> sprintf "%.1f" (ms c))));
+  Lockstep.note ls "frames" (List.concat_map (List.rev listener.frames) ~f:(List.map ~f:(fun (b, _, _) -> b)));
+  [%expect {|
+      sent: done
+      sent: not acknowledged
+      sent: done
+    on the line: 40a 90a 00a. | 43. | 4f 82 10 00.
+    low stretches on the line: 0.60, 1.50, 3.70 ms
+    start bits at: 17.3, 111.2, 157.0 ms
+    |}]
+;;
+
+let%expect_test "cec.s: the TV starts a frame on the same cycle and wins arbitration" =
+  (* first find the cycle the device starts its frame on, then let the TV start there too *)
+  let to_send = [ 2; 0x45; 0x36 ] (* Standby, to the audio system *) in
+  let _, _, _, bus = run_cec ~from_tv:[] ~to_send ~cycles:200_000 () in
+  let start = Option.value_exn (Array.findi bus ~f:(fun _ b -> b = 0)) |> fst in
+  let _, words, listener, _ =
+    run_cec ~from_tv:[ start, [ 0x05; 0x8F ] ] ~to_send ~cycles:(start + 600_000) ()
+  in
+  print_cec_words words;
+  printf "on the line: %s\n" (String.concat ~sep:" | " (List.rev_map listener.frames ~f:Cec_node.to_string));
+  [%expect {|
+      sent: lost arbitration
+    on the line: 05a 8fa.
+    |}]
+;;

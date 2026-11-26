@@ -203,6 +203,11 @@ def modbus(line, key):
     return [int(m.group(1))] if m and key == "exceptions" else []
 
 
+def cec_byte(line):
+    m = re.match(r"0x([0-9a-f]{2})$", line)
+    return [int(m.group(1), 16)] if m else []
+
+
 def spi(clk, mosi, cs, miso, mode):
     return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
 
@@ -258,6 +263,7 @@ CASES = {
     # requests come in on RX (ui3), replies go out on TX (uo0)
     "modbus": (["uart:rx=ui3:tx=uo0:baudrate=115200:parity=even", "modbus:scchannel=TX:cschannel=RX"],
                [(k, "modbus", lambda l, k=k: modbus(l, k)) for k in ("ids", "crc", "exceptions")]),
+    "cec": (["cec:cec=uio0"], [("frames", "cec=bytes", cec_byte)]),
     "dali": (["dali:dali=ui3"],
              [(k, "dali=address:command:reply", lambda l, k=k: dali(l, k)) for k in ("data", "reply")]),
 }
