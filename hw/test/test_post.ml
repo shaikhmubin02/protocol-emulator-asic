@@ -1488,3 +1488,257 @@ let%expect_test "swd_host.s: a debug port and memory access port written from AD
     cycles with both sides driving SWDIO: 0
     |}]
 ;;
+
+(* ---- S/PDIF (IEC 60958): biphase-mark, a line coding the chip was not designed with, done by
+   the fabric. *)
+let%expect_test "biphase-mark (S/PDIF) transmit configuration, proved" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and d = G.input "d" 1
+  and raw = G.input "raw" 1 in
+  prove
+    ~words:(Pemu_post.Fabric_post.bmc_tx ~n_le:8)
+    ~ext:G.(raw @: gnd @: d)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let open G in
+      let first = q.(0)
+      and last = q.(1) in
+      (* biphase-mark: a transition at the start of every cell, another in the middle for a 1;
+         raw: a transition for each 1 *)
+      let line = mux2 raw (last ^: d) (mux2 first ~:last (last ^: d)) in
+      [ out.(0), first
+      ; f.(0), raw |: ~:first
+      ; out.(1), line
+      ; f.(1), line
+      ; out.(2), first &: ~:raw (* hold: the bit stays for its second half *)
+      ]);
+  [%expect {| proved: configuration = rule for all states and inputs |}]
+;;
+
+let spdif_rate = 8, 35 (* a half-bit tick of 8 + 35/256 cycles: 128 a frame, 48 kHz *)
+
+(* consumer channel status (24 bytes, bit 0 of byte 0 first): copying permitted, 48 kHz *)
+let spdif_status = [ 0x04; 0x00; 0x00; 0x02 ] @ List.init 20 ~f:(fun _ -> 0)
+
+let%expect_test "spdif_tx.s: a block of 192 frames, read by a receiver written from IEC 60958" =
+  let ls =
+    Lockstep.create ~fabric:(Pemu_post.Fabric_post.bmc_tx ~n_le:Model.n_le) (load "spdif_tx.s")
+  in
+  Lockstep.record ls ~ns_per_cycle:20. "spdif";
+  let frames = 194 in
+  let left k = ((k * 0x010203) + 0x123456) land 0xFFFFFF
+  and right k = ((k * 0x00F1E2) + 0x765432) land 0xFFFFFF in
+  let cbit k = (List.nth_exn spdif_status (k mod 192 / 8) lsr (k mod 8)) land 1 in
+  let sub ~pre s ~c = [ s land 0xFFFF; (s lsr 16) lor (c lsl 10) lor (pre lsl 12) ] in
+  let host =
+    [ fst spdif_rate; snd spdif_rate ]
+    @ List.concat
+        (List.init frames ~f:(fun k ->
+           sub ~pre:(if k % 192 = 0 then 2 else 0) (left k) ~c:(cbit k) @ sub ~pre:1 (right k) ~c:(cbit k)))
+  in
+  let pending = Queue.of_list host in
+  let ui = bit_of spdif_rate in
+  let cycles = Float.iround_up_exn (Float.of_int (frames * 128) *. ui) + 2000 in
+  let samples = Array.create ~len:cycles 0 in
+  for c = 0 to cycles - 1 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    samples.(c) <- bit (Lockstep.uo ls) 0
+  done;
+  let subs, bad_runs = Spdif_node.decode samples ~ui in
+  let subs = Array.of_list subs in
+  let want = 2 * (frames - 1) in
+  printf "subframes read: %d (the last frame is still being sent when the host runs out)\n"
+    (Array.length subs);
+  let ok f = Array.for_alli (Array.sub subs ~pos:0 ~len:want) ~f in
+  printf "preambles B at frames 0 and 192, M and W in between: %b\n"
+    (ok (fun i s ->
+       Char.equal s.preamble
+         (if i % 2 = 1 then 'W' else if i / 2 % 192 = 0 then 'B' else 'M')));
+  printf "audio samples as sent: %b\n"
+    (ok (fun i s -> s.audio = if i % 2 = 0 then left (i / 2) else right (i / 2)));
+  printf "parity good: %b; every cell starts with a transition: %b; runs not 1, 2 or 3 half cells: %d\n"
+    (ok (fun _ s -> s.parity_ok))
+    (ok (fun _ s -> s.biphase_ok))
+    bad_runs;
+  let per_frame = Float.of_int (subs.(384).at - subs.(0).at) /. 192. in
+  printf "a frame every %.2f cycles: %.1f Hz at 50 MHz\n" per_frame (50e6 /. per_frame);
+  let status =
+    List.init 4 ~f:(fun byte ->
+      List.fold (List.init 8 ~f:Fn.id) ~init:0 ~f:(fun a k -> a lor (subs.(2 * ((8 * byte) + k)).c lsl k)))
+  in
+  printf "channel status bytes 0 to 3, from the C bits: %s\n" (hex_bytes status);
+  (* sigrok's decoder spends the first preamble learning the clock: from the second subframe on *)
+  Lockstep.note ls "audio" (List.tl_exn (List.concat (List.init 5 ~f:(fun k -> [ left k; right k ]))) |> Fn.flip List.take 8);
+  [%expect {|
+    subframes read: 387 (the last frame is still being sent when the host runs out)
+    preambles B at frames 0 and 192, M and W in between: true
+    audio samples as sent: true
+    parity good: true; every cell starts with a transition: true; runs not 1, 2 or 3 half cells: 0
+    a frame every 1041.50 cycles: 48007.7 Hz at 50 MHz
+    channel status bytes 0 to 3, from the C bits: 04 00 00 02
+    |}]
+;;
+
+(* ---- NEC infrared. The tests run 100 times faster than real time (see "Rates" in
+   docs/post-freeze/results.md): the carrier tick is 6 + 148/256 cycles (3.8 MHz instead of
+   38 kHz) and the unit 281 cycles; the recording is written at 2000 ns a cycle, so it shows the
+   real 38 kHz and 562.5 us. *)
+let nec_tick = 6, 148
+let nec_unit = 281
+let nec_scale = 100.
+
+let%expect_test "infrared carrier configuration, proved" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and on = G.input "on" 1
+  and d = G.input "d" 1 in
+  prove
+    ~words:(Pemu_post.Fabric_post.ir_carrier ~n_le:8)
+    ~ext:G.(on @: gnd @: d)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let open G in
+      [ out.(0), q.(0); f.(0), ~:(q.(0)) (* the carrier toggles every tick *)
+      ; out.(1), q.(0) &: on (* the line: carrier while on *)
+      ; out.(2), vdd (* hold: the word is never used up *)
+      ]);
+  [%expect {| proved: configuration = rule for all states and inputs |}]
+;;
+
+let nec_codes = [ 0, 0xFF00, 0x45; 0, 0x1234, 0x16; 1, 0, 0; 1, 0, 0; 0, 0xFB04, 0x08 ]
+
+let nec_host codes =
+  [ fst nec_tick; snd nec_tick; nec_unit ]
+  @ List.concat_map codes ~f:(fun (kind, address, command) ->
+    if kind = 1 then [ 1 ] else [ 0; address; command ])
+;;
+
+let%expect_test "nec_tx.s: frames and repeat codes, through a receiver written from the NEC format" =
+  let ls =
+    Lockstep.create ~fabric:(Pemu_post.Fabric_post.ir_carrier ~n_le:Model.n_le) (load "nec_tx.s")
+  in
+  Lockstep.record ls ~ns_per_cycle:(20. *. nec_scale) "nec_tx";
+  let pending = Queue.of_list (nec_host nec_codes) in
+  let demod = Ir_node.Demod.create ~hold:14 in
+  let cycles = (List.length nec_codes * 192 * nec_unit) + 4000 in
+  let led = Array.create ~len:cycles 0
+  and out = Array.create ~len:cycles 1 in
+  for c = 0 to cycles - 1 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    led.(c) <- bit (Lockstep.uo ls) 0;
+    out.(c) <- Ir_node.Demod.step demod ~cycle:c ~led:led.(c)
+  done;
+  let codes = Ir_node.decode out ~unit:(Float.of_int nec_unit) in
+  List.iter codes ~f:(fun (code, _) -> printf "%s\n" (Ir_node.to_string code));
+  (match codes with
+   | (_, a) :: (_, b) :: _ ->
+     printf "frames start %.1f ms apart\n" (Float.of_int (b - a) *. nec_scale /. 50e3)
+   | _ -> ());
+  (* the carrier: rising edges inside the first mark *)
+  let rises =
+    List.filter (List.init (12 * nec_unit) ~f:(fun i -> i + 100)) ~f:(fun i ->
+      led.(i) = 1 && led.(i - 1) = 0)
+  in
+  let period =
+    Float.of_int (List.last_exn rises - List.hd_exn rises) /. Float.of_int (List.length rises - 1)
+  in
+  let high = Array.count (Array.sub led ~pos:100 ~len:(12 * nec_unit)) ~f:(fun l -> l = 1) in
+  printf "carrier %.2f kHz, %.0f%% on while sending\n"
+    (50e3 /. period /. nec_scale)
+    (100. *. Float.of_int high /. Float.of_int (12 * nec_unit));
+  (* the stock decoder does not take extended addresses: it reads the address, not the command,
+     of the second frame (scripts/sigrok_check.py) *)
+  Lockstep.note ls "addresses" [ 0x00; 0x1234; 0x04 ];
+  Lockstep.note ls "commands" [ 0x45; 0x08 ];
+  [%expect {|
+    address 00, command 45
+    extended address 1234, command 16
+    repeat
+    repeat
+    address 04, command 08
+    frames start 107.9 ms apart
+    carrier 38.01 kHz, 50% on while sending
+    |}]
+;;
+
+let run_nec_rx line =
+  let ls = Lockstep.create (load "nec_rx.s") in
+  let pending = Queue.of_list [ nec_unit ] in
+  let got = ref [] in
+  Array.iter line ~f:(fun level ->
+    let send = Queue.peek pending in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = level lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got));
+  let rec show = function
+    | 1 :: lo :: hi :: rest ->
+      printf "  %s\n" (Ir_node.to_string (Frame ((hi lsl 16) lor lo)));
+      show rest
+    | 2 :: rest ->
+      printf "  repeat\n";
+      show rest
+    | w :: rest when w land 0xFF = 3 ->
+      printf "  a frame broke off after %d bits\n" (w lsr 8);
+      show rest
+    | w :: rest ->
+      printf "  ? %04x\n" w;
+      show rest
+    | [] -> ()
+  in
+  show (List.rev !got)
+;;
+
+let nec_frame address command = Ir_node.Frame (address lor (command lsl 16) lor ((command lxor 0xFF) lsl 24))
+
+let%expect_test "nec_rx.s: remotes 10% slow and 20% fast, and a frame that breaks off" =
+  let unit = Float.of_int nec_unit in
+  let codes =
+    [ nec_frame (0x00 lor (0xFF lsl 8)) 0x45; Ir_node.Repeat; nec_frame 0x1234 0x16 ]
+  in
+  List.iter [ 1.1; 0.8 ] ~f:(fun stretch ->
+    printf "units %.0f%% of 562.5 us:\n" (100. *. stretch);
+    run_nec_rx (Ir_node.line ~unit ~stretch codes));
+  printf "cut after 10 bits:\n";
+  run_nec_rx
+    (Array.append
+       (Ir_node.line ~unit ~cut:10 [ nec_frame 0x10EF 0x01 ])
+       (Ir_node.line ~unit [ nec_frame 0x10EF 0x02 ]));
+  [%expect {|
+    units 110% of 562.5 us:
+      address 00, command 45
+      repeat
+      extended address 1234, command 16
+    units 80% of 562.5 us:
+      address 00, command 45
+      repeat
+      extended address 1234, command 16
+    cut after 10 bits:
+      a frame broke off after 9 bits
+      address ef, command 02
+    |}]
+;;
+
+let%expect_test "nec_tx.s through a receiver model into nec_rx.s" =
+  let tx =
+    Lockstep.create ~fabric:(Pemu_post.Fabric_post.ir_carrier ~n_le:Model.n_le) (load "nec_tx.s")
+  and rx = Lockstep.create (load "nec_rx.s") in
+  let to_tx = Queue.of_list (nec_host nec_codes)
+  and to_rx = Queue.of_list [ nec_unit ] in
+  let demod = Ir_node.Demod.create ~hold:14 in
+  let got = ref [] in
+  for c = 0 to (List.length nec_codes * 192 * nec_unit) + 4000 do
+    let send = Queue.peek to_tx in
+    let _, wrote = Lockstep.step ?send tx Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn to_tx : int);
+    let ir = Ir_node.Demod.step demod ~cycle:c ~led:(bit (Lockstep.uo tx) 0) in
+    let send = Queue.peek to_rx in
+    let read, wrote = Lockstep.step ?send ~receive:true rx { Model.Pads.zero with ui_in = ir lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn to_rx : int);
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  printf "%s\n" (String.concat ~sep:" " (List.rev_map !got ~f:(sprintf "%x")));
+  [%expect {| 1 ff00 ba45 1 1234 e916 2 2 1 fb04 f708 |}]
+;;

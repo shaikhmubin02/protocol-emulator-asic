@@ -72,3 +72,40 @@ let hdlc_rx ~n_le =
   w.(7) <- word ~on_rx:true ~inputs:[ Ext1; Prev2 ] (fun s five _ _ -> five land s);
   w
 ;;
+
+(* Biphase-mark (S/PDIF, IEC 60958; also AES3 and USB PD), on TX ticks at twice the bit rate.
+   Every bit cell starts with a transition, and a 1 has another one in the middle. None of the
+   configurations the chip was designed with has this coding.
+   - element 0: 1 in the first half of a bit (toggles every tick; held at 1 in raw mode);
+   - element 2: hold = first half and not raw: the shifter keeps each bit for two ticks;
+   - element 1: the line. Its LUT output goes to the pin and its flop keeps the level just sent:
+     line = last line XOR (raw ? bit : (first half ? 1 : bit)).
+   ext2 (FABCTL[0]) = raw mode, for the preambles, which break the biphase rule on purpose: there
+   each shifter bit is one half cell, 1 = a transition. Written as transitions, a preamble is
+   the same whatever level the line had before it.
+   Roles: line = 1, hold = 2. Start values: element 0 = 1, the line 0. *)
+let bmc_tx ~n_le =
+  let w = Array.create ~len:n_le empty in
+  w.(0) <- word ~use_ff:true ~init:1 ~inputs:[ Self; Ext2 ] (fun first raw _ _ -> if raw = 1 then 1 else 1 - first);
+  w.(1)
+  <- word ~inputs:[ Ext0; Le0; Self; Ext2 ] (fun d first last raw ->
+       let t = if raw = 1 then d else if first = 1 then 1 else d in
+       last lxor t);
+  w.(2) <- word ~inputs:[ Le0; Ext2 ] (fun first raw _ _ -> first land (1 - raw));
+  w
+;;
+
+(* An infrared carrier (NEC, RC-5, ...), on TX ticks at twice the carrier frequency.
+   - element 0: toggles every tick: the carrier, a square wave at half the tick rate;
+   - element 1: the line = carrier AND ext2 (FABCTL[0]): the program turns the carrier on for a
+     mark and off for a space at exact times (WAIT time), the fabric makes the 38 kHz;
+   - element 2: hold = 1 always, so the one word the program loads is never used up and the
+     bit engine keeps showing the line on the pin.
+   Roles: line = 1, hold = 2. *)
+let ir_carrier ~n_le =
+  let w = Array.create ~len:n_le empty in
+  w.(0) <- word ~use_ff:true ~inputs:[ Self ] (fun c _ _ _ -> 1 - c);
+  w.(1) <- word ~inputs:[ Le0; Ext2 ] (fun c on _ _ -> c land on);
+  w.(2) <- word ~inputs:[] (fun _ _ _ _ -> 1);
+  w
+;;

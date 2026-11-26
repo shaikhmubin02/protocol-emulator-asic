@@ -182,7 +182,9 @@ words (`TX`, `RX`), so the program is free while bits go out and come in.
 
 TX and RX each have a phase accumulator with the same period, BAUD + BAUDF/256 cycles on
 average (exactly BAUD cycles when BAUDF = 0). `BEN 1` restarts both, so the first tick comes a
-full bit time later. An edge on the RX pin (the start edge, or every edge with RXCFG[11])
+full bit time later. It also empties the TX holding register and the shifter, drops a received
+word, and loads the fabric's start values, so a program hands over its first TX word after
+`BEN 1` (there is a whole bit time for it before the first tick). An edge on the RX pin (the start edge, or every edge with RXCFG[11])
 restarts the RX phase so the next sample is about half a bit time later, in the middle of the
 bit. TX ticks are not affected, so full duplex works.
 
