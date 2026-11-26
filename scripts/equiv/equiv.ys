@@ -1,0 +1,55 @@
+# RTL (src/pemu.v) against the signed-off gate netlist, with Yosys equiv_*.
+# Run from the repo root through scripts/equiv/run.sh (it makes build/equiv/comb_cells.v and
+# copies the netlist it is given to build/equiv/netlist.v).
+# The configuration latches (sg13cmos5l_dlhq_1) and the SRAM macros are black boxes on both
+# sides, matched by instance name. `expose -evert` cuts both designs at them: each black box's
+# outputs become a module input shared by the two sides, and its inputs become module outputs
+# that are compared. So every gate between the black boxes is checked, and the black boxes are
+# shown to receive the same inputs on both sides (sound: they are the same cells, by name).
+
+# ---- gold: the RTL
+read_verilog -lib scripts/equiv/blackboxes.v
+read_verilog src/pemu.v
+hierarchy -top tt_um_shaikhmubin02_pemu
+proc
+flatten
+# the same light optimisation the synthesis did: merge identical flops, drop flops stuck at
+# their reset value (so the RTL has no extra state the netlist lost)
+opt -sat
+async2sync
+opt_clean
+# the netlist names every bit of a bus on its own (engine0.pc[3]); split the buses on both sides
+# so equiv_make can pair the registers by name
+splitnets
+expose -evert t:sg13cmos5l_dlhq_1 t:RM_IHPSG13_1P_256x16_c2_bm_bist
+rename tt_um_shaikhmubin02_pemu gold
+design -stash gold
+
+# ---- gate: the netlist, with the PDK's combinational cells and the behavioural sequential ones
+read_verilog -lib scripts/equiv/blackboxes.v
+read_verilog scripts/equiv/cells_seq_nolatch.v
+read_verilog build/equiv/comb_cells.v
+read_verilog build/equiv/netlist.v
+hierarchy -top tt_um_shaikhmubin02_pemu
+proc
+flatten
+async2sync
+opt_clean
+# the netlist names every bit of a bus on its own (engine0.pc[3]); split the buses on both sides
+# so equiv_make can pair the registers by name
+splitnets
+expose -evert t:sg13cmos5l_dlhq_1 t:RM_IHPSG13_1P_256x16_c2_bm_bist
+rename tt_um_shaikhmubin02_pemu gate
+design -stash gate
+
+# ---- compare
+design -copy-from gold -as gold gold
+design -copy-from gate -as gate gate
+# internal mux wires that synthesis rebuilt in the context of the mux after them: same names,
+# not the same logic on their own (a run without the list shows them as the only unproven
+# points). Every proof assumes the other matched points, so they are not matched at all.
+equiv_make -blacklist scripts/equiv/blacklist.txt gold gate equiv
+hierarchy -top equiv
+equiv_simple -seq 2
+equiv_induct -seq 2
+equiv_status

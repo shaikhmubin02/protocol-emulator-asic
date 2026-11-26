@@ -51,6 +51,7 @@ from the repository root unless they say otherwise.
 
 | Claim | Evidence | Command |
 |---|---|---|
+| The signed-off gate netlist does what the RTL does | two checks against the netlist of the signing-off gds run: (1) formal, Yosys `equiv_*` with the configuration latches and SRAMs as the same black boxes on both sides: 7059 of 7203 matched points proven by induction, every register and output except the heads of the mailbox FIFOs (144 points, below); (2) simulation, the RTL and the netlist side by side under Verilator with the same random programs, host traffic over SPI (empty mailboxes read too), debugger commands and pin levels, every output compared every cycle: 16 seeds, 80 million cycles, equal throughout | `scripts/equiv/run.sh`, `scripts/equiv/lockstep/run.sh` (need the netlist from the gds run's artifact and the PDK cell models) |
 | The hardware has not changed since the freeze tag `rtl-freeze-2026-11-26` | the hardware sources, the flow settings and the regenerated Verilog are compared with the tag | `bash scripts/check_freeze.sh` |
 | The protocols in `docs/post-freeze/results.md` work on the frozen RTL, each against a model of the other end written from its specification, with the RTL in lockstep with the model every cycle | `hw/test/test_post.ml`, `hw/test/test_post2.ml`, `hw/test/test_usb.ml` (the USB keyboard: the whole chip, a host written from USB 2.0, and the board's processor at the SPI port's speed), models in `hw/test/*_node.ml` | `cd hw && dune build @runtest` |
 | Each fabric configuration written after the freeze computes the rule it is meant to, for every state and input | SAT proofs with each protocol's tests (the designed-for USB transmit configuration, which had only been simulated, is now proved too, in `test_usb.ml`) | `cd hw && dune build @runtest` |
@@ -59,6 +60,10 @@ from the repository root unless they say otherwise.
 
 ## What is not covered here
 
+- The formal check of the netlist leaves 144 points unproven: the heads of the inbox and outbox
+  FIFOs of each engine and the host's read data, which plain induction does not close (deeper
+  induction does not either). For those, the evidence is the lockstep simulation of the RTL and
+  the netlist and the gate-level cocotb tests, not a proof.
 - Nothing here has run on silicon or an FPGA. All evidence is simulation, gate-level
   simulation and proofs.
 - The chip-level statements combine two proofs that meet at the engine ports: the engine proof

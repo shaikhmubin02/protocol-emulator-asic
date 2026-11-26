@@ -89,6 +89,10 @@ separately in OCaml, and most of the testing compares the two:
   S/PDIF, Wiegand, PS/2, Modbus, CEC, DALI, and the USB keyboard's whole enumeration). All 60
   decoded fields agree with what the tests sent and received.
 - cocotb tests in `test/` that drive the chip only through its pins, as the board will.
+- The signed-off netlist against the RTL (`scripts/equiv/`): formally with Yosys (7059 of 7203
+  matched points proven; the mailbox FIFO heads are not), and in simulation, both under
+  Verilator with the same random board activity and every output compared every cycle
+  (80 million cycles, equal).
 - Unmodified Linux software on the other end (`sim/`): the whole chip's RTL under Verilator,
   driven through its pins. OpenOCD scans `jtag_tap.s` through its remote_bitbang driver and finds
   the TAP's IDCODE, and mbpoll reads and writes holding registers of `modbus.s` through a
