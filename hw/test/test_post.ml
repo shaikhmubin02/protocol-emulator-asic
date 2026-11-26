@@ -1742,3 +1742,112 @@ let%expect_test "nec_tx.s through a receiver model into nec_rx.s" =
   printf "%s\n" (String.concat ~sep:" " (List.rev_map !got ~f:(sprintf "%x")));
   [%expect {| 1 ff00 ba45 1 1234 e916 2 2 1 fb04 f708 |}]
 ;;
+
+(* ---- Wiegand, at the real rate: 20 us pulses 200 us apart, the shortest the interface allows
+   (and 50 us / 400 us for one card). The other ends are Wiegand_node. *)
+let wg_width = 1000
+let wg_period = 10_000
+
+let wg_line ls k = if bit (Lockstep.uio_oe ls) k = 1 then bit (Lockstep.uio_out ls) k else 1
+
+let%expect_test "wiegand_tx.s: 26-bit and 34-bit cards, read off the lines" =
+  let ls = Lockstep.create (load "wiegand_tx.s") in
+  Lockstep.record ls ~ns_per_cycle:20. ~pullups:0x03 "wiegand";
+  let pending = Queue.of_list [ wg_width; wg_period; 26; 123; 4567; 34; 0x1234; 0xBEEF ] in
+  let cycles = 2000 + ((26 + 34 + 32) * wg_period) in
+  let d0 = Array.create ~len:cycles 1
+  and d1 = Array.create ~len:cycles 1 in
+  for c = 0 to cycles - 1 do
+    let send = Queue.peek pending in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    d0.(c) <- wg_line ls 0;
+    d1.(c) <- wg_line ls 1
+  done;
+  let messages = Wiegand_node.read ~d0 ~d1 ~silence:50_000 in
+  List.iter messages ~f:(fun m ->
+    let bits = List.map m ~f:(fun (b, _, _) -> b) in
+    let widths = List.map m ~f:(fun (_, w, _) -> w)
+    and periods = List.map (List.tl_exn m) ~f:(fun (_, _, p) -> p) in
+    let us x = Float.of_int x /. 50. in
+    printf "%s\n  pulses %.1f to %.1f us wide, %.1f to %.1f us apart\n" (Wiegand_node.to_string bits)
+      (us (List.reduce_exn widths ~f:Int.min))
+      (us (List.reduce_exn widths ~f:Int.max))
+      (us (List.reduce_exn periods ~f:Int.min))
+      (us (List.reduce_exn periods ~f:Int.max)));
+  Lockstep.note ls "bits"
+    (Wiegand_node.card ~bits:26 ~facility:123 ~number:4567
+     @ Wiegand_node.card ~bits:34 ~facility:0x1234 ~number:0xBEEF);
+  [%expect {|
+    26 bits: facility 123, card 4567, parity good
+      pulses 20.0 to 20.0 us wide, 200.0 to 200.0 us apart
+    34 bits: facility 4660, card 48879, parity good
+      pulses 20.0 to 20.0 us wide, 200.0 to 200.0 us apart
+    |}]
+;;
+
+let run_wiegand_rx (d0, d1) =
+  let ls = Lockstep.create (load "wiegand_rx.s") in
+  let pending = Queue.of_list [ 50 ] (* about 1 ms of silence ends a message *) in
+  let got = ref [] in
+  Array.iteri d0 ~f:(fun c l0 ->
+    let send = Queue.peek pending in
+    let read, wrote =
+      Lockstep.step ?send ~receive:true ls { Model.Pads.zero with uio_in = l0 lor (d1.(c) lsl 1) }
+    in
+    if wrote then ignore (Queue.dequeue_exn pending : int);
+    Option.iter read ~f:(fun v -> got := v :: !got));
+  let rec show = function
+    | h :: a :: b :: c :: rest when h land 0x8000 <> 0 ->
+      let n = h land 0xFF in
+      let v = (a lsl 32) lor (b lsl 16) lor c in
+      printf "  %s\n" (Wiegand_node.to_string (List.init n ~f:(fun k -> (v lsr (n - 1 - k)) land 1)));
+      show rest
+    | w :: rest ->
+      printf "  ? %04x\n" w;
+      show rest
+    | [] -> ()
+  in
+  show (List.rev !got)
+;;
+
+let%expect_test "wiegand_rx.s: cards from a reader, a 37-bit message, and a glitch" =
+  let raw37 = List.init 37 ~f:(fun k -> if k % 3 = 0 then 1 else 0) in
+  printf "20 us pulses, 200 us apart, a 0.8 us glitch on D0 in the first message:\n";
+  run_wiegand_rx
+    (Wiegand_node.lines ~width:1000 ~period:10_000 ~glitch:(15_000, 40)
+       [ Wiegand_node.card ~bits:26 ~facility:18 ~number:999; raw37 ]);
+  printf "50 us pulses, 400 us apart:\n";
+  run_wiegand_rx
+    (Wiegand_node.lines ~width:2500 ~period:20_000
+       [ Wiegand_node.card ~bits:34 ~facility:0xA5A5 ~number:0x0F0F ]);
+  [%expect {|
+    20 us pulses, 200 us apart, a 0.8 us glitch on D0 in the first message:
+      26 bits: facility 18, card 999, parity good
+      37 bits: 1001001001001001001001001001001001001
+    50 us pulses, 400 us apart:
+      34 bits: facility 42405, card 3855, parity good
+    |}]
+;;
+
+let%expect_test "wiegand_tx.s on one engine into wiegand_rx.s on another" =
+  let tx = Lockstep.create (load "wiegand_tx.s")
+  and rx = Lockstep.create (load "wiegand_rx.s") in
+  let to_tx = Queue.of_list [ wg_width; wg_period; 26; 200; 65535; 34; 0; 1 ]
+  and to_rx = Queue.of_list [ 50 ] in
+  let got = ref [] in
+  for _ = 0 to 2000 + ((26 + 34 + 32) * wg_period) + 60_000 do
+    let send = Queue.peek to_tx in
+    let _, wrote = Lockstep.step ?send tx Model.Pads.zero in
+    if wrote then ignore (Queue.dequeue_exn to_tx : int);
+    let send = Queue.peek to_rx in
+    let read, wrote =
+      Lockstep.step ?send ~receive:true rx
+        { Model.Pads.zero with uio_in = wg_line tx 0 lor (wg_line tx 1 lsl 1) }
+    in
+    if wrote then ignore (Queue.dequeue_exn to_rx : int);
+    Option.iter read ~f:(fun v -> got := v :: !got)
+  done;
+  printf "%s\n" (String.concat ~sep:" " (List.rev_map !got ~f:(sprintf "%04x")));
+  [%expect {| 801a 0000 0391 ffff 8022 0000 0000 0002 |}]
+;;
