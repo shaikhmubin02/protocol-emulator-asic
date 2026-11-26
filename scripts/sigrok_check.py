@@ -191,6 +191,18 @@ def ps2_data(line):
     return [int(m.group(1), 16)] if m else []
 
 
+def modbus(line, key):
+    """Every frame's server ID (0 for a broadcast), every frame's CRC verdict (1 right, 0 wrong),
+    and the exception codes of replies."""
+    if key == "ids":
+        m = re.match(r"Slave ID: (\d+)$", line)
+        return [int(m.group(1))] if m else [0] if line == "Broadcast message" else []
+    if key == "crc":
+        return [1] if line == "CRC correct" else [0] if line.startswith("CRC should be") else []
+    m = re.match(r"Error (\d+): ", line)
+    return [int(m.group(1))] if m and key == "exceptions" else []
+
+
 def spi(clk, mosi, cs, miso, mode):
     return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
 
@@ -243,6 +255,9 @@ CASES = {
     "rc5": (["ir_rc5:ir=ui3:polarity=active-low:protocol=extended"],
             [("frames", "ir_rc5=address:command", rc5)]),
     "ps2_dev": (["ps2:clk=uio0:data=uio1"], [("bytes", "ps2=word", ps2_data)]),
+    # requests come in on RX (ui3), replies go out on TX (uo0)
+    "modbus": (["uart:rx=ui3:tx=uo0:baudrate=115200:parity=even", "modbus:scchannel=TX:cschannel=RX"],
+               [(k, "modbus", lambda l, k=k: modbus(l, k)) for k in ("ids", "crc", "exceptions")]),
     "dali": (["dali:dali=ui3"],
              [(k, "dali=address:command:reply", lambda l, k=k: dali(l, k)) for k in ("data", "reply")]),
 }

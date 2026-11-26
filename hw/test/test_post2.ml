@@ -241,3 +241,115 @@ let%expect_test "ps2_host.s on one engine and ps2_dev.s on another" =
     device side: 1ff 1f2
     |}]
 ;;
+
+(* ---- Modbus RTU at 115200 bit/s, at the real rate. The other end is Modbus_node: a client from
+   the specifications, and the host's register map. RS-485 half duplex: the bus is the chip's TX
+   while its driver is on, else the client's; the transceiver's receiver is off while it sends. *)
+let mb_rate = 434, 7
+let mb_bit = bit_of mb_rate
+let mb_char = 11. *. mb_bit
+
+let mb_requests =
+  let open Modbus_node in
+  let bad = List.mapi (with_crc [ 0x01; 0x03; 0x00; 0x00; 0x00; 0x02 ]) ~f:(fun i x -> if i = 6 then x lxor 1 else x) in
+  [ "read registers 0 and 1", with_crc [ 0x01; 0x03; 0x00; 0x00; 0x00; 0x02 ]
+  ; "write register 1", with_crc [ 0x01; 0x06; 0x00; 0x01; 0x12; 0x34 ]
+  ; "write registers 2 and 3", with_crc [ 0x01; 0x10; 0x00; 0x02; 0x00; 0x02; 0x04; 0xAB; 0xCD; 0xEF; 0x01 ]
+  ; "read registers 0 to 3", with_crc [ 0x01; 0x03; 0x00; 0x00; 0x00; 0x04 ]
+  ; "a request for server 2", with_crc [ 0x02; 0x03; 0x00; 0x00; 0x00; 0x01 ]
+  ; "a request with its CRC wrong", bad
+  ; "broadcast: write register 5", with_crc [ 0x00; 0x06; 0x00; 0x05; 0x00; 0x07 ]
+  ; "function 0x2b (not served)", with_crc [ 0x01; 0x2B; 0x0E; 0x01; 0x00 ]
+  ]
+;;
+
+let%expect_test "modbus.s: a server, against a client written from the Modbus specifications" =
+  let ls = Lockstep.create (load "modbus.s") in
+  Lockstep.record ls ~ns_per_cycle:20. "modbus";
+  let regs = Modbus_node.Registers.create () in
+  let slot = 150_000 in
+  let starts = List.mapi mb_requests ~f:(fun i _ -> 2000 + (i * slot)) in
+  let cycles = 2000 + (List.length mb_requests * slot) in
+  let client = Modbus_node.client_line ~bit:mb_bit (List.zip_exn starts (List.map mb_requests ~f:snd)) ~cycles in
+  let to_chip = Queue.of_list [ fst mb_rate; snd mb_rate; 1 ] in
+  let bus = Array.create ~len:cycles 1
+  and de = Array.create ~len:cycles 0 in
+  let pdu = ref [] in
+  for c = 0 to cycles - 1 do
+    let chip_de = bit (Lockstep.uo ls) 1 in
+    let line = if chip_de = 1 then bit (Lockstep.uo ls) 0 else client.(c) in
+    bus.(c) <- line;
+    de.(c) <- chip_de;
+    let rx = if chip_de = 1 then 1 else line in
+    let send = Queue.peek to_chip in
+    let read, wrote = Lockstep.step ?send ~receive:true ls { Model.Pads.zero with ui_in = rx lsl 3 } in
+    if wrote then ignore (Queue.dequeue_exn to_chip : int);
+    Option.iter read ~f:(fun w ->
+      if w land 0xFF00 = 0x0100
+      then pdu := !pdu @ [ w land 0xFF ]
+      else (
+        if w land 0x8000 <> 0
+        then (
+          let reply = Modbus_node.Registers.answer regs !pdu in
+          if w land 0x4000 = 0 then List.iter (List.length reply :: reply) ~f:(Queue.enqueue to_chip));
+        pdu := []))
+  done;
+  let chars = Modbus_node.read ~bit:mb_bit bus in
+  let frames = ref [] in
+  List.iteri (List.zip_exn mb_requests starts) ~f:(fun i ((what, req), at) ->
+    let req_end = Float.of_int at +. (Float.of_int (List.length req) *. mb_char) in
+    let reply =
+      List.filter chars ~f:(fun (c, _, _) ->
+        Float.(of_int c > req_end) && c < at + slot)
+    in
+    frames := !frames @ [ req ] @ if List.is_empty reply then [] else [ List.map reply ~f:(fun (_, b, _) -> b) ];
+    match reply with
+    | [] -> printf "%-30s no reply\n" what
+    | (first, _, _) :: _ ->
+      let bytes = List.map reply ~f:(fun (_, b, _) -> b) in
+      let last, _, _ = List.last_exn reply in
+      let gaps =
+        List.map (List.zip_exn (List.drop_last_exn reply) (List.tl_exn reply)) ~f:(fun ((a, _, _), (b, _, _)) ->
+          (Float.of_int (b - a) -. mb_char) /. mb_char)
+      in
+      let rise = ref first in
+      while !rise > 0 && de.(!rise - 1) = 1 do decr rise done;
+      let fall = ref last in
+      while !fall < cycles - 1 && de.(!fall) = 1 do incr fall done;
+      let stop_end = Float.of_int last +. mb_char in
+      printf "%-30s %s, CRC %s, parity %s\n" what (hex_bytes bytes)
+        (if Modbus_node.crc16 bytes = 0 then "good" else "BAD")
+        (if List.for_all reply ~f:(fun (_, _, ok) -> ok) then "good" else "BAD");
+      printf "%-30s %.2f characters after the request; gaps up to %.2f characters; driver on %.1f bit before, off %.1f bit after\n" ""
+        ((Float.of_int first -. req_end) /. mb_char)
+        (List.fold gaps ~init:0. ~f:Float.max)
+        (Float.of_int (first - !rise) /. mb_bit)
+        ((Float.of_int !fall -. stop_end) /. mb_bit);
+      ignore i);
+  printf "registers 0 to 5: %s\n" (String.concat ~sep:" " (List.init 6 ~f:(fun k -> sprintf "%04x" regs.(k))));
+  (* every frame on the bus in order, requests and replies: its server ID, whether its CRC is
+     right (sigrok's decoder does not decode function 0x2b, so it gives no verdict for that
+     request), and the exception codes of the replies that are exceptions *)
+  Lockstep.note ls "ids" (List.map !frames ~f:List.hd_exn);
+  Lockstep.note ls "crc"
+    (List.filter_map !frames ~f:(fun f ->
+       if List.nth_exn f 1 = 0x2B then None else Some (if Modbus_node.crc16 f = 0 then 1 else 0)));
+  Lockstep.note ls "exceptions"
+    (List.filter_map !frames ~f:(fun f -> if List.nth_exn f 1 land 0x80 <> 0 then Some (List.nth_exn f 2) else None));
+  [%expect {|
+    read registers 0 and 1         01 03 04 10 00 10 01 32 f3, CRC good, parity good
+                                   4.22 characters after the request; gaps up to 0.00 characters; driver on 1.0 bit before, off 0.0 bit after
+    write register 1               01 06 00 01 12 34 d5 7d, CRC good, parity good
+                                   4.26 characters after the request; gaps up to 0.00 characters; driver on 1.0 bit before, off 0.0 bit after
+    write registers 2 and 3        01 10 00 02 00 02 e0 08, CRC good, parity good
+                                   4.29 characters after the request; gaps up to 0.00 characters; driver on 1.0 bit before, off 0.0 bit after
+    read registers 0 to 3          01 03 08 10 00 12 34 ab cd ef 01 1a 46, CRC good, parity good
+                                   4.24 characters after the request; gaps up to 0.00 characters; driver on 1.0 bit before, off 0.0 bit after
+    a request for server 2         no reply
+    a request with its CRC wrong   no reply
+    broadcast: write register 5    no reply
+    function 0x2b (not served)     01 ab 01 9e f0, CRC good, parity good
+                                   4.29 characters after the request; gaps up to 0.00 characters; driver on 1.0 bit before, off 0.0 bit after
+    registers 0 to 5: 1000 1234 abcd ef01 1004 0007
+    |}]
+;;

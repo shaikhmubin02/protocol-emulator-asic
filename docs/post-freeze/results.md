@@ -30,13 +30,15 @@ How each one is checked:
 | NEC infrared transmit and receive | fits; receive times long pulses with counted loops | works: the fabric makes the 38 kHz carrier (proved) and the program turns it on and off at exact times; frames, extended addresses and repeat codes 108 ms apart, read by a receiver model; the receiver reads remotes running 10% slow and 20% fast and reports a frame that breaks off | 62 and 73, plus the fabric configuration | agrees on the addresses and on the commands of the standard frames (decoder limit below) |
 | Wiegand 26/34 | fits | works at 20 us pulses 200 us apart (the shortest the interface allows): 26-bit and 34-bit cards with their parity bits, and a receiver that ignores a 0.8 us glitch and takes messages of any length up to 48 bits | 77 and 48 | agrees |
 | RC-5 infrared transmit and receive | fits, on half-bit ticks | works: the same carrier configuration at 36 kHz, Manchester bits on deadlines, the toggle bit kept across held keys, the RC-5X seventh command bit; the receiver finds each bit by the edge in its middle and reads remotes 10% slow and 10% fast, and reports a frame that breaks off | 64 and 56 | agrees, including the RC-5X command |
+| PS/2 device (the chip as a keyboard) and PS/2 host | fits, on `uio` pins (open drain) | works at a 12.5 kHz clock: the keyboard sends scan codes, gives way when the computer holds the clock low and sends the cut-off byte again, clocks in the computer's commands and acknowledges them, and answers reset, read ID and echo; the host reads a keyboard model and sends it commands, checking each acknowledge | 177 and 116 | agrees on the keyboard's bytes (decoder limit below) |
+| Modbus RTU server | fits with a few registers on the chip; CRC-16 in firmware | works at 115200 bit/s as the link layer, with the registers kept by the host: frames ended by 3.5 characters of silence, CRC-16, parity, server address and broadcasts, exception replies, and the RS-485 driver enable on exactly from a bit before the reply until its last stop bit | 179 | agrees on every frame's server ID and CRC and on the exception code |
 
-Not attempted yet from the planned list: AX.25/APRS, PS/2 device and host, HDMI-CEC, Modbus RTU,
-USB low speed HID enumeration.
+Not attempted yet from the planned list: AX.25/APRS, HDMI-CEC, USB low speed HID enumeration.
 
 ## Rates
 
-CAN, HDLC, DMX512, MIDI, JTAG, SWD, S/PDIF and Wiegand run at their real rates in the tests.
+CAN, HDLC, DMX512, MIDI, JTAG, SWD, S/PDIF, Wiegand, PS/2 and Modbus run at their real rates in the
+tests.
 DALI, NEC and RC-5 run 100 times faster and LIN 10 times faster, to keep the cycle-by-cycle runs
 short; their recordings are written with the real timing, so the decoders read them at the real
 rates (DALI at 1200 bit/s, LIN at 19200 bit/s, NEC with its 38 kHz carrier, RC-5 at 1.778 ms a
@@ -78,3 +80,10 @@ did not; the specification settled it each time. The check works around each one
   the idle line before the stream's first edge as one of them; a real capture starts in the
   middle of a stream, so the check starts the recording at its first edge. Learning the clock
   uses up the first preamble, so its first sample is the second subframe's.
+- PS/2: the decoder ends a frame only at the next falling edge of the clock, so in a burst of
+  bytes it takes the next byte's start bit for the end of the last one and reads one bit late
+  from then on. In the recorded test the computer holds the clock low briefly after each byte,
+  as hosts may, which gives the decoder that edge. It also takes every falling edge as a bit, so
+  it cannot follow bytes from the host to the device; those are checked by my models.
+- Modbus: the decoder does not decode function 0x2b, so it gives no CRC verdict for that
+  request; the check leaves that one out.
