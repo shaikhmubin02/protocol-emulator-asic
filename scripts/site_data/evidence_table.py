@@ -109,7 +109,8 @@ def main():
             if f == "test_bitstream_proof.ml" or "proved" in t:
                 proved |= fabric_configs(b)
     # programs that the Verilator harness puts in front of Linux software
-    linux = set(re.findall(r"build/([a-z0-9_]+)\.hex", read(os.path.join(ROOT, "sim", "main.cpp"))))
+    harness = "".join(read(p) for p in sorted(glob.glob(os.path.join(ROOT, "sim", "*.cpp"))))
+    linux = set(re.findall(r"build/([a-z0-9_]+)\.hex", harness))
     rows = []
     for path in sorted(glob.glob(os.path.join(FW, "*.s"))):
         name = os.path.splitext(os.path.basename(path))[0]

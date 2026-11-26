@@ -9,6 +9,10 @@
 //   pemu_sim modbus           modbus.s on engine 0 behind a pseudo-terminal, for mbpoll or any
 //                             Modbus RTU client (115200 bit/s 8E1, server address 1)
 //   pemu_sim modbus --selftest  one read request sent by this program instead
+//   pemu_sim usb [port]       usb_dev_rx.s and usb_dev_tx.s on engines 0 and 1, a USB keyboard
+//                             exported over USB/IP (default port 3240) for Linux's vhci_hcd;
+//                             attach it with usbip_attach.py
+//   pemu_sim usb --selftest   enumerated and read by this program instead
 //
 // The firmware hex files are read from build/ (the Makefile assembles them).
 
@@ -29,6 +33,7 @@
 #include <vector>
 
 #include "chip.h"
+#include "usb.h"
 
 namespace {
 
@@ -346,6 +351,7 @@ int main(int argc, char** argv) {
   bool self = argc > 2 && std::string(argv[2]) == "--selftest";
   if (cmd == "jtag") return self ? selftest() : serve_jtag(argc > 2 ? std::atoi(argv[2]) : 3335);
   if (cmd == "modbus") return self ? modbus_selftest() : serve_modbus();
-  std::fprintf(stderr, "usage: pemu_sim jtag [port | --selftest] | modbus [--selftest]\n");
+  if (cmd == "usb") return self ? usb::selftest() : usb::serve(argc > 2 ? std::atoi(argv[2]) : 3240);
+  std::fprintf(stderr, "usage: pemu_sim jtag [port | --selftest] | modbus [--selftest] | usb [port | --selftest]\n");
   return 2;
 }

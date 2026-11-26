@@ -13,6 +13,8 @@ let () =
     ; "ir_carrier", F.ir_carrier
     ; "ax25_tx", F.ax25_tx
     ; "ax25_rx", F.ax25_rx
+    ; "usb_rx", F.usb_rx
+    ; "usb_tx", Pemu.Bitstream.usb_tx
     ]
   in
   match Sys.get_argv () with

@@ -92,7 +92,9 @@ separately in OCaml, and most of the testing compares the two:
 - Unmodified Linux software on the other end (`sim/`): the whole chip's RTL under Verilator,
   driven through its pins. OpenOCD scans `jtag_tap.s` through its remote_bitbang driver and finds
   the TAP's IDCODE, and mbpoll reads and writes holding registers of `modbus.s` through a
-  pseudo-terminal.
+  pseudo-terminal. The Linux kernel's own USB stack enumerates the USB keyboard through
+  USB/IP and vhci_hcd: `lsusb` lists it, usbhid binds to it, and a program turns its Caps Lock
+  LED on through hidraw and reads back what the chip types.
 
 ## Layout
 
@@ -129,10 +131,12 @@ The cocotb tests:
     cd test
     make
 
-The Linux demos (need `verilator`, `openocd` and `mbpoll`):
+The Linux demos (need `verilator`, `openocd` and `mbpoll`; the USB one needs root and a kernel
+with `USBIP_VHCI_HCD` and `USB_HID`, as WSL2's has):
 
     bash sim/demo_jtag.sh
     bash sim/demo_modbus.sh
+    sudo bash sim/demo_usb.sh
 
 Started from the Tiny Tapeout [ttihp-verilog-template](https://github.com/TinyTapeout/ttihp-verilog-template/tree/cmos5l).
 
