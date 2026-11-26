@@ -183,6 +183,14 @@ def rc5(line):
     return [int(m.group(1))] if m else []
 
 
+def ps2_data(line):
+    # "Data: 1c". The stock decoder ends a frame only at the next falling edge of CLK, so in a
+    # burst it takes the next byte's start bit for that; the recording's host holds CLK low
+    # after each byte, as hosts may, which gives it that edge (hw/test/test_post2.ml).
+    m = re.match(r"Data: ([0-9a-f]{2})$", line)
+    return [int(m.group(1), 16)] if m else []
+
+
 def spi(clk, mosi, cs, miso, mode):
     return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
 
@@ -234,6 +242,7 @@ CASES = {
     "wiegand": (["wiegand:d0=uio0:d1=uio1:bitwidth_ms=1"], [("bits", "wiegand=state", wiegand_bits)]),
     "rc5": (["ir_rc5:ir=ui3:polarity=active-low:protocol=extended"],
             [("frames", "ir_rc5=address:command", rc5)]),
+    "ps2_dev": (["ps2:clk=uio0:data=uio1"], [("bytes", "ps2=word", ps2_data)]),
     "dali": (["dali:dali=ui3"],
              [(k, "dali=address:command:reply", lambda l, k=k: dali(l, k)) for k in ("data", "reply")]),
 }
