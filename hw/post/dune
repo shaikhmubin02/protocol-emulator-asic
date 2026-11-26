@@ -2,6 +2,15 @@
 ; same configuration format as hw/src/bitstream.ml and change nothing in the hardware.
 (library
  (name pemu_post)
+ (modules fabric_post)
  (libraries core pemu)
+ (preprocess
+  (pps ppx_jane)))
+
+; prints a configuration's words, for tests that load it through the host port
+(executable
+ (name fabric_words)
+ (modules fabric_words)
+ (libraries core pemu pemu_post)
  (preprocess
   (pps ppx_jane)))

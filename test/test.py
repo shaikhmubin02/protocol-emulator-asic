@@ -506,3 +506,232 @@ async def test_four_protocols_at_once(dut):
     assert got[1] == want[1], got[1]
     assert got[2] == want[2] and i2c.mem[0x10:0x12] == [0x5A, 0x6B], (got[2], i2c.mem[0x10:0x12])
     assert got[3] == want[3] and ow.written == [0x33], (got[3], ow.written)
+
+
+# ---- protocols written after the RTL freeze, through the pins only. CI runs these on the
+# gate-level netlist too. Firmware and fabric configurations come from hw/firmware and
+# hw/post (test/firmware/*.hex, *.fabric).
+
+
+def fabric(name):
+    with open(os.path.join(HERE, "firmware", name + ".fabric")) as f:
+        return [int(line, 16) for line in f if line.strip()]
+
+
+async def configure(b, e, words, poly=None, init=None):
+    """Load a fabric configuration and CRC settings into engine e (0 or 1) over the host port:
+    region 1, offset 2 * word + half; words 16 and 17 are the CRC polynomial and start value."""
+    for k, w in list(enumerate(words)) + [(16, poly), (17, init)]:
+        if w is not None:
+            await b.write(engine_addr(e, 1, 2 * k), [w & 0xFFFF, w >> 16])
+
+
+async def exchange(b, e, to_send, n_back, rounds=400, idle=200):
+    """Feed words to engine e's inbox and collect n_back words from its outbox."""
+    pending, got = list(to_send), []
+    for _ in range(rounds):
+        if len(got) >= n_back and not pending:
+            break
+        st = await b.read1(status(e))
+        inbox, outbox = (st >> 10) & 3, (st >> 12) & 3
+        if outbox:
+            got += await b.read(mailbox(e), outbox)
+        if inbox < 2 and pending:
+            await b.write(mailbox(e), [pending.pop(0)])
+        await b.wait(idle)
+    return got
+
+
+def can_bits(ident, data):
+    """A CAN 2.0A data frame as the bus carries it, from the Bosch spec: stuffed from the start of
+    frame to the end of the CRC, then CRC delimiter, ACK slot (recessive from the sender), ACK
+    delimiter, end of frame and intermission."""
+    bits = [0] + [(ident >> (10 - k)) & 1 for k in range(11)] + [0, 0, 0]
+    bits += [(len(data) >> (3 - k)) & 1 for k in range(4)]
+    for d in data:
+        bits += [(d >> (7 - k)) & 1 for k in range(8)]
+    crc = 0
+    for x in bits:
+        fb = x ^ ((crc >> 14) & 1)
+        crc = (crc << 1) & 0x7FFF
+        if fb:
+            crc ^= 0x4599
+    bits += [(crc >> (14 - k)) & 1 for k in range(15)]
+    out, run, last = [], 0, None
+    for x in bits:
+        out.append(x)
+        run = run + 1 if x == last else 1
+        last = x
+        if run == 5:
+            out.append(1 - x)
+            last, run = 1 - x, 1
+    ack_slot = len(out) + 1
+    return out + [1, 1, 1] + [1] * 10, ack_slot
+
+
+class CanNode:
+    """Sends one frame on the bus (seen by the chip on ui[3]); the chip's TXD is uio[0], pulled
+    up, so the bus is dominant if either drives it. Records the bus in the middle of the ACK slot."""
+
+    def __init__(self, bits, ack_slot, start, bit=100):
+        self.bits, self.ack_slot, self.start, self.bit = bits, ack_slot, start, bit
+        self.ack = None
+
+    def step(self, b):
+        k = (b.cycle - self.start) // self.bit
+        level = self.bits[k] if 0 <= k < len(self.bits) else 1
+        bus = level & (0 if b.chip_low & 1 else 1)
+        if k == self.ack_slot and (b.cycle - self.start) % self.bit == self.bit // 2:
+            self.ack = bus
+        return 0, bus << 3
+
+
+@cocotb.test()
+async def test_post_can_rx(dut):
+    """can_rx.s (written after the freeze) receives a CAN frame and acknowledges it: the fabric
+    configuration and CRC-15 settings are written over the host port, as a board would."""
+    b = await start(dut)
+    await b.write(program(0), firmware("can_rx.hex"))
+    await configure(b, 0, fabric("can_rx"), poly=0x4599 << 17, init=0)
+    await b.write(glob(0), [0b100 | 0])  # uio[0], the TXD, belongs to engine 0
+    await b.write(glob(0x10), [0b0001])
+    bits, ack_slot = can_bits(0x123, [0xDE, 0xAD])
+    node = CanNode(bits, ack_slot, start=b.cycle + 3000)
+    b.devices = [node]
+    got = await exchange(b, 0, [], 6)
+    dut._log.info(f"{b.cycle} cycles; words {[hex(w) for w in got]}, ACK slot {node.ack}")
+    assert got[:6] == [0x123, 0x102, 0, 0, 0, 0xDEAD], got
+    assert node.ack == 0, "not acknowledged"
+
+
+class JtagController:
+    """Clocks a list of (TMS, TDI) bits into the TAP: TCK on ui[4], TMS ui[5], TDI ui[6]; TDO
+    (uio[0], released outside the shift states) read just before TCK rises."""
+
+    def __init__(self, bits, start, half=25):
+        self.bits, self.start, self.half = bits, start, half
+        self.tdo = []
+
+    def step(self, b):
+        t = b.cycle - self.start
+        k, ph = divmod(t, 2 * self.half) if t >= 0 else (-1, 0)
+        if not 0 <= k < len(self.bits):
+            return 0, 1 << 5
+        tms, tdi = self.bits[k]
+        tck = 1 if ph >= self.half else 0
+        if ph == self.half - 1:
+            self.tdo.append((b.line & 1) if not (b.chip_low & 1) else 0)
+        return 0, (tck << 4) | (tms << 5) | (tdi << 6)
+
+
+@cocotb.test()
+async def test_post_jtag_tap(dut):
+    """jtag_tap.s (written after the freeze): a JTAG controller resets the TAP and reads its
+    IDCODE, then writes USER and reads it back, at 1 MHz TCK."""
+    b = await start(dut)
+    await b.write(program(1), firmware("jtag_tap.hex"))
+    await b.write(glob(0), [0b100 | 1])  # TDO
+    await b.write(glob(0x10), [0b0010])
+    await exchange(b, 1, [0xFEE1, 0x1C0F, 0x1234], 0, rounds=10, idle=10)
+    reset = [(1, 0)] * 5 + [(0, 0)]
+    dr, ir, idle = [(1, 0), (0, 0), (0, 0)], [(1, 0), (1, 0), (0, 0), (0, 0)], [(1, 0), (0, 0)]
+    shift = lambda n, v: [(int(k == n - 1), (v >> k) & 1) for k in range(n)]
+    bits = reset + dr + shift(32, 0) + idle + ir + shift(4, 0b1000) + idle + dr + shift(16, 0xBEEF) + idle
+    bits += dr + shift(16, 0) + idle
+    ctl = JtagController(bits, start=b.cycle + 100)
+    b.devices = [ctl]
+    await b.wait(100 + 2 * 25 * len(bits) + 100)
+    value = lambda pos, n: sum(ctl.tdo[pos + k] << k for k in range(n))
+    idcode = value(len(reset + dr), 32)
+    user_before = value(len(reset + dr) + 32 + len(idle + ir) + 4 + len(idle + dr), 16)
+    user_after = value(len(bits) - len(idle) - 16, 16)
+    dut._log.info(f"IDCODE {idcode:08x}, USER {user_before:04x} then {user_after:04x}")
+    assert idcode == 0x1C0FFEE1 and user_before == 0x1234 and user_after == 0xBEEF
+
+
+@cocotb.test()
+async def test_post_dmx_tx(dut):
+    """dmx_tx.s (written after the freeze): a DMX512 packet on uo[0]: the break and the mark
+    after break are the bit engine's idle level, so they are whole 4 us bits."""
+    b = await start(dut)
+    await b.write(program(2), firmware("dmx_tx.hex"))
+    await b.write(glob(8), [0b100 | 2])
+    await b.write(glob(0x10), [0b0100])
+    line = []
+
+    class Probe:
+        def step(self, b):
+            line.append(b.uo() & 1)
+            return 0, 0
+
+    b.devices = [Probe()]
+    await exchange(b, 2, [200, 23, 3, 0, 3, 0x00, 0x5A, 0xA5], 0, rounds=20, idle=20)
+    await b.wait(20000)
+    # runs of equal levels after the first break starts
+    s = next(i for i in range(1, len(line)) if line[i] == 0 and line[i - 1] == 1)
+    runs, i = [], s
+    while i < len(line):
+        j = i
+        while j < len(line) and line[j] == line[i]:
+            j += 1
+        runs.append((line[i], j - i))
+        i = j
+    (brk_l, brk), (mab_l, mab) = runs[0], runs[1]
+    slots, k = [], s + brk + mab
+    for _ in range(3):
+        bitv = [line[k + 100 + 200 * n] for n in range(11)]
+        assert bitv[0] == 0 and bitv[9] == 1 and bitv[10] == 1, bitv
+        slots.append(sum(bitv[1 + n] << n for n in range(8)))
+        k += 11 * 200
+    dut._log.info(f"break {brk} cycles, MAB {mab} cycles, slots {[hex(x) for x in slots]}")
+    assert brk_l == 0 and brk == 23 * 200 and mab_l == 1 and mab == 3 * 200
+    assert slots == [0x00, 0x5A, 0xA5]
+
+
+@cocotb.test()
+async def test_post_spdif_tx(dut):
+    """spdif_tx.s (written after the freeze): S/PDIF on uo[0], biphase-mark from the fabric
+    configuration bmc_tx, read back from the edges alone. At 40 cycles a half bit: at 48 kHz (8
+    cycles) the program needs two host words every 520 cycles, faster than a host that reads
+    the status before each write can send them over the port."""
+    b = await start(dut)
+    await b.write(program(1), firmware("spdif_tx.hex"))
+    await configure(b, 1, fabric("bmc_tx"))
+    await b.write(glob(8), [0b100 | 1])
+    await b.write(glob(0x10), [0b0010])
+    line = []
+
+    class Probe:
+        def step(self, b):
+            line.append(b.uo() & 1)
+            return 0, 0
+
+    b.devices = [Probe()]
+    samples = [0x123456, 0x765432, 0x0ABCDE, 0x543210, 0x111111, 0x222222]
+    words = [40, 0]
+    for i, x in enumerate(samples):
+        words += [x & 0xFFFF, (x >> 16) | ((2 if i == 0 else (1 if i % 2 else 0)) << 12)]
+    await exchange(b, 1, words, 0, rounds=40, idle=5)
+    await b.wait(6000)
+    ui = 40
+    edges = [i for i in range(1, len(line)) if line[i] != line[i - 1]]
+    cells = []
+    for a, c in zip(edges, edges[1:]):
+        n = round((c - a) / ui)
+        assert 1 <= n <= 3, (c - a)
+        cells += [line[a]] * n
+    pats = {"B": [1, 1, 1, 0, 1, 0, 0, 0], "M": [1, 1, 1, 0, 0, 0, 1, 0], "W": [1, 1, 1, 0, 0, 1, 0, 0]}
+    found, i = [], 0
+    while i + 64 <= len(cells):
+        first = cells[i]
+        name = next((p for p, v in pats.items()
+                     if all(cells[i + j] == (v[j] if first else 1 - v[j]) for j in range(8))), None)
+        if name is None:
+            i += 1
+            continue
+        bits = [int(cells[i + 8 + 2 * k] != cells[i + 9 + 2 * k]) for k in range(28)]
+        found.append((name, sum(bits[k] << k for k in range(24)), sum(bits) % 2 == 0))
+        i += 64
+    dut._log.info(f"subframes {[(n, hex(v), p) for n, v, p in found]}")
+    assert [n for n, _, _ in found[:4]] == ["B", "W", "M", "W"]
+    assert [v for _, v, _ in found[:4]] == samples[:4] and all(p for _, _, p in found[:4])
