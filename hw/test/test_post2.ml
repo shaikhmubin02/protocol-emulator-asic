@@ -470,3 +470,196 @@ let%expect_test "cec.s: the TV starts a frame on the same cycle and wins arbitra
     on the line: 05a 8fa.
     |}]
 ;;
+
+(* ---- AX.25 packet radio (APRS) over Bell 202 audio. Run 100 times faster than real time: a bit
+   is 416 cycles, the 1200 Hz and 2200 Hz half periods 208 and 114. The other end is Ax25_node. *)
+let ax_bit = 416
+let ax_mark = 208
+let ax_space = 114
+let ax_threshold = 161
+
+let%expect_test "AX.25 transmit configuration (HDLC stuffing, then NRZI), proved" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and d = G.input "d" 1
+  and flags = G.input "flags" 1 in
+  prove
+    ~words:(Pemu_post.Fabric_post.ax25_tx ~n_le:8)
+    ~ext:G.(flags @: gnd @: d)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let open G in
+      let hold = q.(1) &: ~:flags in
+      let sent = d &: ~:hold in
+      let counting = ~:flags in
+      let level = mux2 sent q.(6) ~:(q.(6)) (* a 0 changes the line *) in
+      [ out.(0), hold
+      ; out.(6), level
+      ; f.(6), level
+      ; f.(5), sent &: counting
+      ; f.(4), sent &: q.(5) &: counting
+      ; f.(3), sent &: q.(4) &: counting
+      ; f.(2), sent &: q.(3) &: counting
+      ; f.(1), sent &: q.(2) &: counting
+      ]);
+  [%expect {| proved: configuration = rule for all states and inputs |}]
+;;
+
+let%expect_test "AX.25 receive configuration (NRZI, then HDLC de-stuffing), proved" =
+  let q = Array.init 8 ~f:(fun i -> G.input (sprintf "q%d" i) 1)
+  and s = G.input "sample" 1 in
+  prove
+    ~words:(Pemu_post.Fabric_post.ax25_rx ~n_le:8)
+    ~ext:G.(gnd @: s @: gnd)
+    ~q
+    ~spec:(fun ~f ~out ->
+      let open G in
+      let d = ~:(s ^: q.(1)) (* the same level as the last sample: a 1 *) in
+      [ out.(0), d
+      ; f.(1), s
+      ; f.(2), d
+      ; f.(3), d &: q.(2)
+      ; f.(4), d &: q.(3)
+      ; f.(5), d &: q.(4)
+      ; f.(6), d &: q.(5)
+      ; out.(7), q.(6) &: ~:d (* the 0 after five 1s *)
+      ]);
+  [%expect {| proved: configuration = rule for all states and inputs |}]
+;;
+
+let aprs_frames =
+  let open Ax25_node in
+  [ ui_frame ~dest:("APRS", 0) ~src:("N0CALL", 7) ~path:[ "WIDE1", 1 ] "!4903.50N/07201.75W-pemu test"
+  ; ui_frame ~dest:("APRS", 0) ~src:("N0CALL", 7) ~path:[] ">running on the bit engine"
+  ]
+;;
+
+let print_ax25_words words =
+  let rec go acc = function
+    | w :: rest when w land 0x2000 <> 0 -> go [] rest (* not a frame: drop its bytes *)
+    | w :: rest when w land 0x8000 <> 0 ->
+      let bytes = List.rev acc in
+      let body = List.take bytes (List.length bytes - 2) in
+      printf "  %s  (FCS %s)\n"
+        (if List.length body >= 16 then Ax25_node.to_string body else "?")
+        (if w land 0x4000 <> 0 then "right" else "WRONG");
+      go [] rest
+    | w :: rest -> go ((w land 0xFF) :: acc) rest
+    | [] -> ()
+  in
+  go [] words
+;;
+
+let%expect_test "ax25_rx.s: APRS frames from audio written from the AX.25 and Bell 202 specs" =
+  let open Ax25_node in
+  let good = List.map aprs_frames ~f:with_fcs in
+  let broken =
+    List.mapi (with_fcs (List.hd_exn aprs_frames)) ~f:(fun i b -> if i = 3 then b lxor 0x10 else b)
+  in
+  let frames = [ List.nth_exn good 0; broken; List.nth_exn good 1 ] in
+  let audio =
+    audio ~bit:(Float.of_int ax_bit) ~mark:(Float.of_int ax_mark) ~space:(Float.of_int ax_space)
+      (nrzi (bits frames))
+  in
+  let ls =
+    Lockstep.create ~fabric:(Pemu_post.Fabric_post.ax25_rx ~n_le:Model.n_le) ~crc_poly:(0x1021 lsl 16)
+      ~crc_init:(0xFFFF lsl 16) (load "ax25_rx.s")
+  in
+  let pending = Queue.of_list [ ax_bit; ax_threshold ] in
+  let got = ref [] in
+  Array.iter audio ~f:(fun a ->
+    (* the program drives uio[1] and the bit engine reads it back through the pad *)
+    let pads = Lockstep.uio_out ls land Lockstep.uio_oe ls in
+    step ls pending got { Model.Pads.uio_in = pads; ui_in = a lsl 3 });
+  print_ax25_words (List.rev !got);
+  printf "the model reads its own audio as: %s\n"
+    (String.concat ~sep:" | "
+       (List.map (decode ~bit:(Float.of_int ax_bit) ~threshold:(Float.of_int ax_threshold) audio)
+          ~f:(fun (b, ok) -> sprintf "%d bytes, FCS %s" (List.length b) (if ok then "right" else "WRONG"))));
+  [%expect {|
+      N0CALL-7>APRS,WIDE1-1:!4903.50N/07201.75W-pemu test  (FCS right)
+      N0CALL-7>APR[,WIDE1-1:!4903.50N/07201.75W-pemu test  (FCS WRONG)
+      N0CALL-7>APRS:>running on the bit engine  (FCS right)
+    the model reads its own audio as: 52 bytes, FCS right | 52 bytes, FCS WRONG | 42 bytes, FCS right
+    |}]
+;;
+
+(* the model of the whole chip, checked against the RTL at the pins every cycle *)
+let attach_chip_model (t : Chip_host.t) =
+  let model = Chip_model.create () in
+  t.before_edge
+  <- (fun t ->
+       let rtl =
+         { Chip_model.uo_out = Chip_host.uo t; uio_out = Chip_host.uio_out t; uio_oe = Chip_host.uio_oe t }
+       in
+       if not (Chip_model.equal_outputs rtl (Chip_model.outputs model))
+       then failwithf "chip and model differ at cycle %d" t.cycle ();
+       Chip_model.step model
+         { Model.Pads.ui_in = Chip_host.get t.i.ui_in; uio_in = Chip_host.get t.i.uio_in })
+;;
+
+let%expect_test "three engines on one chip: ax25_tx.s frames, afsk_tx.s tones, ax25_rx.s reads them back" =
+  let module H = Chip_host in
+  let t = H.create () in
+  attach_chip_model t;
+  let asm name = load name in
+  H.load t 0 (asm "ax25_tx.s");
+  H.load t 1 (asm "ax25_rx.s");
+  H.load t 2 (asm "afsk_tx.s");
+  let config e fabric =
+    Array.iteri fabric ~f:(fun k w -> H.set_config t e ~word:k w);
+    H.set_config t e ~word:16 (0x1021 lsl 16);
+    H.set_config t e ~word:17 (0xFFFF lsl 16)
+  in
+  config 0 (Pemu_post.Fabric_post.ax25_tx ~n_le:Model.n_le);
+  config 1 (Pemu_post.Fabric_post.ax25_rx ~n_le:Model.n_le);
+  H.own t ~pin:2 ~engine:0 (* the NRZI line, on a uio pad so the tone engine can read it *);
+  H.own t ~pin:1 ~engine:1 (* the tone the receiver finds *);
+  H.own t ~pin:8 ~engine:2 (* the audio *);
+  (* the audio goes out on uo[0] and back in on ui[3], as through a radio's audio path *)
+  let audio = ref [] in
+  t.on_cycle
+  <- (fun t ->
+       let a = H.uo t land 1 in
+       audio := a :: !audio;
+       t.ui <- (t.ui land lnot 0x08) lor (a lsl 3));
+  H.run t 0b111;
+  let send e w = H.write t (H.mailbox e) [ w ] in
+  List.iter [ ax_bit; 6 ] ~f:(send 0) (* bit time, opening flags *);
+  List.iter [ ax_bit; ax_threshold ] ~f:(send 1);
+  List.iter [ ax_mark; ax_space ] ~f:(send 2);
+  let from_rx = ref []
+  and from_tx = ref [] in
+  let drain e acc =
+    let n = H.outbox_count t e in
+    if n > 0 then acc := List.rev_append (H.read t (H.mailbox e) n) !acc
+  in
+  List.iter aprs_frames ~f:(fun f ->
+    let words = List.length f :: f in
+    List.iter words ~f:(fun w ->
+      while H.inbox_count t 0 >= 2 do
+        H.cycles t 200;
+        drain 1 from_rx
+      done;
+      send 0 w));
+  for _ = 1 to 400 do
+    H.cycles t 1000;
+    drain 1 from_rx;
+    drain 0 from_tx
+  done;
+  printf "ax25_tx.s said: %s\n" (String.concat ~sep:" " (List.rev_map !from_tx ~f:Int.to_string));
+  printf "ax25_rx.s, on the same chip:\n";
+  print_ax25_words (List.rev !from_rx);
+  let samples = Array.of_list (List.rev !audio) in
+  printf "the model reads the chip's audio as:\n";
+  List.iter (Ax25_node.decode ~bit:(Float.of_int ax_bit) ~threshold:(Float.of_int ax_threshold) samples)
+    ~f:(fun (b, ok) -> printf "  %s  (FCS %s)\n" (Ax25_node.to_string b) (if ok then "right" else "WRONG"));
+  [%expect {|
+    ax25_tx.s said: 1 1
+    ax25_rx.s, on the same chip:
+      N0CALL-7>APRS,WIDE1-1:!4903.50N/07201.75W-pemu test  (FCS right)
+      N0CALL-7>APRS:>running on the bit engine  (FCS right)
+    the model reads the chip's audio as:
+      N0CALL-7>APRS,WIDE1-1:!4903.50N/07201.75W-pemu test  (FCS right)
+      N0CALL-7>APRS:>running on the bit engine  (FCS right)
+    |}]
+;;

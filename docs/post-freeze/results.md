@@ -33,17 +33,18 @@ How each one is checked:
 | PS/2 device (the chip as a keyboard) and PS/2 host | fits, on `uio` pins (open drain) | works at a 12.5 kHz clock: the keyboard sends scan codes, gives way when the computer holds the clock low and sends the cut-off byte again, clocks in the computer's commands and acknowledges them, and answers reset, read ID and echo; the host reads a keyboard model and sends it commands, checking each acknowledge | 177 and 116 | agrees on the keyboard's bytes (decoder limit below) |
 | Modbus RTU server | fits with a few registers on the chip; CRC-16 in firmware | works at 115200 bit/s as the link layer, with the registers kept by the host: frames ended by 3.5 characters of silence, CRC-16, parity, server address and broadcasts, exception replies, and the RS-485 driver enable on exactly from a bit before the reply until its last stop bit | 179 | agrees on every frame's server ID and CRC and on the exception code |
 | HDMI-CEC | fits | works: one program follows every frame and acknowledges the ones addressed to it, and sends for the host after 7 free bit periods, with broadcasts' reversed acknowledge, and arbitration (the device stops cleanly when a lower address starts on the same cycle); bit times on the line exactly 0.6, 1.5 and 3.7 ms. After losing arbitration it does not pick up the winner's frame | 186 | agrees on every byte |
+| AX.25 / APRS at 1200 baud (HDLC on one engine, AFSK tones on another) | fits | works, on one chip: one engine frames APRS packets (the HDLC stuffing configuration with an NRZI element added, proved), a second makes the Bell 202 tones, and a third reads them back: it times the audio's edges, and the bit engine with a new configuration (NRZI decoding and de-stuffing in all 8 elements, proved) gives it the bits; frames checked by the FCS, and also read from the chip's audio by a model written from the AX.25 specification. Tested 100 times faster than real time | 50, 11 and 88, plus two fabric configurations | no stock decoder for the audio; checked by my AX.25 model |
 
-Not attempted yet from the planned list: AX.25/APRS, USB low speed HID enumeration.
+Not attempted yet from the planned list: USB low speed HID enumeration.
 
 ## Rates
 
 CAN, HDLC, DMX512, MIDI, JTAG, SWD, S/PDIF, Wiegand, PS/2 and Modbus run at their real rates in
-the tests. DALI, NEC and RC-5 run 100 times faster and LIN and HDMI-CEC 10 times faster, to keep
-the cycle-by-cycle runs short; their recordings are written with the real timing, so the
-decoders read them at the real rates (DALI at 1200 bit/s, LIN at 19200 bit/s, NEC with its
-38 kHz carrier, RC-5 at 1.778 ms a bit, CEC at 2.4 ms a bit). LIN also has a test at the real
-19200 bit/s. A faster test is the harder one for the firmware, since its fixed instruction
+the tests. DALI, NEC, RC-5 and AX.25 run 100 times faster and LIN and HDMI-CEC 10 times
+faster, to keep the cycle-by-cycle runs short; their recordings are written with the real
+timing, so the decoders read them at the real rates (DALI at 1200 bit/s, LIN at 19200 bit/s,
+NEC with its 38 kHz carrier, RC-5 at 1.778 ms a bit, CEC at 2.4 ms a bit). LIN also has a test
+at the real 19200 bit/s. A faster test is the harder one for the firmware, since its fixed instruction
 counts take a larger share of each bit.
 
 ## What I got wrong, and what the tests found
@@ -58,6 +59,9 @@ counts take a larger share of each bit.
 - `BEN 1` empties the TX holding register. Two programs handed the bit engine their first word
   before `BEN 1`: the S/PDIF stream started without its first preamble, and the infrared carrier
   never started. The word now comes after `BEN 1`, and `docs/isa.md` says so.
+- A uo pin reads back the engine's own output register, not another engine's: my first AX.25
+  wiring had the tone engine read the framing engine's uo pin, which it cannot see. The line moved
+  to a uio pad, and `docs/isa.md` now says so.
 - My JTAG monitor's first output format could not be decoded: data words could have bit 15 set,
   the same bit that marks the end of a scan. Data words now carry 15 bits.
 

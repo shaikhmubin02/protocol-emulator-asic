@@ -109,3 +109,38 @@ let ir_carrier ~n_le =
   w.(2) <- word ~inputs:[] (fun _ _ _ _ -> 1);
   w
 ;;
+
+(* AX.25 transmit (packet radio): HDLC framing as in hdlc_tx, then NRZI, as AX.25 sends it: a 0
+   changes the line, a 1 leaves it. Elements 0 to 5 are hdlc_tx's (the rule of five, ext2 = 1
+   while flags go out); element 6 is the NRZI line: its LUT output (to the pin) is its flop's
+   level, changed when the bit actually sent (data, or the stuffed 0 while holding) is 0, and its
+   flop keeps that level. Roles: line = 6, hold = 0. *)
+let ax25_tx ~n_le =
+  let w = hdlc_tx ~n_le in
+  w.(6)
+  <- word ~inputs:[ Ext0; Le0; Self ] (fun d hold level _ ->
+       let sent = d land (1 - hold) in
+       if sent = 1 then level else 1 - level);
+  w
+;;
+
+(* AX.25 receive: NRZI decoding and HDLC de-stuffing, on RX ticks. There is no room for a flag
+   element as well, so the program finds flags itself: six 1s in a row among the kept bits (the 0
+   that ends a flag comes after five 1s, so it is dropped like a stuffed one).
+   - element 0: the bit, decoded: 1 if the sample is the same as the last one (the rx bit role);
+   - element 1: the last sample;
+   - elements 2..6: e2 = the last bit was 1, e(k) = it and the k-2 before it were all 1, so
+     e6 = the last five bits were 1;
+   - element 7: drop = five 1s and now a 0: the stuffed bit.
+   Roles: rx bit = 0, drop = 7. *)
+let ax25_rx ~n_le =
+  let w = Array.create ~len:n_le empty in
+  w.(0) <- word ~on_rx:true ~inputs:[ Ext1; Next ] (fun s last _ _ -> if s = last then 1 else 0);
+  w.(1) <- word ~on_rx:true ~use_ff:true ~inputs:[ Ext1 ] (fun s _ _ _ -> s);
+  w.(2) <- word ~on_rx:true ~use_ff:true ~inputs:[ Le0 ] (fun d _ _ _ -> d);
+  for k = 3 to 6 do
+    w.(k) <- word ~on_rx:true ~use_ff:true ~inputs:[ Le0; Prev ] (fun d below _ _ -> d land below)
+  done;
+  w.(7) <- word ~on_rx:true ~inputs:[ Le0; Prev ] (fun d five _ _ -> five land (1 - d));
+  w
+;;
