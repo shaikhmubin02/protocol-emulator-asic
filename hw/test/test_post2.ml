@@ -584,19 +584,6 @@ let%expect_test "ax25_rx.s: APRS frames from audio written from the AX.25 and Be
 ;;
 
 (* the model of the whole chip, checked against the RTL at the pins every cycle *)
-let attach_chip_model (t : Chip_host.t) =
-  let model = Chip_model.create () in
-  t.before_edge
-  <- (fun t ->
-       let rtl =
-         { Chip_model.uo_out = Chip_host.uo t; uio_out = Chip_host.uio_out t; uio_oe = Chip_host.uio_oe t }
-       in
-       if not (Chip_model.equal_outputs rtl (Chip_model.outputs model))
-       then failwithf "chip and model differ at cycle %d" t.cycle ();
-       Chip_model.step model
-         { Model.Pads.ui_in = Chip_host.get t.i.ui_in; uio_in = Chip_host.get t.i.uio_in })
-;;
-
 let%expect_test "three engines on one chip: ax25_tx.s frames, afsk_tx.s tones, ax25_rx.s reads them back" =
   let module H = Chip_host in
   let t = H.create () in

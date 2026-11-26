@@ -144,3 +144,29 @@ let ax25_rx ~n_le =
   w.(7) <- word ~on_rx:true ~inputs:[ Le0; Prev ] (fun d five _ _ -> five land (1 - d));
   w
 ;;
+
+(* USB low-speed receive: NRZI decoding and de-stuffing, on RX ticks (one tick per bit). A USB
+   sender puts a 0 after six 1s; the receiver throws away the bit after six 1s. Six needs one
+   more flop than a thermometer of 8 elements has room for, so the run of 1s is counted in
+   binary (3 flops for 0 to 7).
+   - element 0: the bit, decoded: 1 if the sample is the same as the last one (the rx bit role);
+   - element 1: the last sample (its flop; start value 0, the idle J state has D+ low);
+   - elements 2, 3, 4: c0, c1, c2 = how many 1s in a row before this bit, cleared by a 0:
+     on a 1 the count goes up by one (7 wraps to 0, which only a broken packet reaches);
+   - element 5: drop = c2 & c1, shown as its LUT output: the count is 6 (or 7), so this bit
+     is a stuffed one. The stuffed bit is a 0, so it clears the count itself.
+   Roles: rx bit = 0, drop = 5. *)
+let usb_rx ~n_le =
+  let w = Array.create ~len:n_le empty in
+  w.(0) <- word ~on_rx:true ~inputs:[ Ext1; Next ] (fun s last _ _ -> if s = last then 1 else 0);
+  w.(1) <- word ~on_rx:true ~use_ff:true ~inputs:[ Ext1 ] (fun s _ _ _ -> s);
+  w.(2) <- word ~on_rx:true ~use_ff:true ~inputs:[ Le0; Self ] (fun d c0 _ _ -> d land (1 - c0));
+  w.(3)
+  <- word ~on_rx:true ~use_ff:true ~inputs:[ Le0; Self; Prev ] (fun d c1 c0 _ ->
+       d land (c1 lxor c0));
+  w.(4)
+  <- word ~on_rx:true ~use_ff:true ~inputs:[ Le0; Self; Prev; Prev2 ] (fun d c2 c1 c0 ->
+       d land (c2 lxor (c1 land c0)));
+  w.(5) <- word ~on_rx:true ~inputs:[ Prev; Prev2 ] (fun c2 c1 _ _ -> c2 land c1);
+  w
+;;

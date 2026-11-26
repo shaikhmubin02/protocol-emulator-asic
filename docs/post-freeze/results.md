@@ -39,8 +39,9 @@ How each one is checked:
 | Modbus RTU server | fits with a few registers on the chip; CRC-16 in firmware | works at 115200 bit/s as the link layer, with the registers kept by the host: frames ended by 3.5 characters of silence, CRC-16, parity, server address and broadcasts, exception replies, and the RS-485 driver enable on exactly from a bit before the reply until its last stop bit | 179 | agrees on every frame's server ID and CRC and on the exception code |
 | HDMI-CEC | fits | works: one program follows every frame and acknowledges the ones addressed to it, and sends for the host after 7 free bit periods, with broadcasts' reversed acknowledge, and arbitration (the device stops cleanly when a lower address starts on the same cycle); bit times on the line exactly 0.6, 1.5 and 3.7 ms. After losing arbitration it does not pick up the winner's frame | 186 | agrees on every byte |
 | AX.25 / APRS at 1200 baud (HDLC on one engine, AFSK tones on another) | fits | works, on one chip: one engine frames APRS packets (the HDLC stuffing configuration with an NRZI element added, proved), a second makes the Bell 202 tones, and a third reads them back: it times the audio's edges, and the bit engine with a new configuration (NRZI decoding and de-stuffing in all 8 elements, proved) gives it the bits; frames checked by the FCS, and also read from the chip's audio by a model written from the AX.25 specification. Tested 100 times faster than real time | 50, 11 and 88, plus two fabric configurations | no stock decoder for the audio; checked by my AX.25 model |
+| USB low speed HID keyboard (enumeration, then typing) | fits only with the host holding the descriptors | works, with a processor next to the chip holding the descriptors, as predicted: a host written from the USB 2.0 specification enumerates the chip the way Linux does (two bus resets, a 64-byte device descriptor read at address 0, SET_ADDRESS, the device, configuration, string and HID report descriptors, SET_CONFIGURATION, SET_IDLE, SET_REPORT for the keyboard LEDs) and then reads 8 key reports from endpoint 1. Engine 0 receives (NRZI and de-stuffing in a new fabric configuration, proved; the CRC-16 in the CRC unit; the address, endpoint and CRC-5 of a token checked with one 16-bit compare), engine 1 answers (the designed-for USB transmit configuration, now also proved, and the CRC unit sending the CRC-16), each answer 3.50 to 3.69 bit times after the host's packet (USB allows 2 to 6.5), every edge exactly on the bit grid, D+ and D- changing in the same cycle. NAK while the processor is still loading, ACK, STALL, DATA0/DATA1 kept, a packet whose ACK was lost sent again, a broken ACK and a SETUP with a bad CRC handled as the specification says, no answer to another address. The processor is modelled at the SPI port's real speed: it reads SETUP data straight out of engine 0's registers and loads engine 1 through its inbox. The whole chip ran in lockstep with the chip model, 613,000 cycles. Not run against real hardware or a real host yet | 253 and 190 (the receiver has 3 words left), plus the new fabric configuration | agrees on every handshake and data packet, the host's and the chip's |
 
-Not attempted yet from the planned list: USB low speed HID enumeration.
+No protocol from the planned list is left.
 
 ## Rates
 
@@ -50,7 +51,9 @@ faster, to keep the cycle-by-cycle runs short; their recordings are written with
 timing, so the decoders read them at the real rates (DALI at 1200 bit/s, LIN at 19200 bit/s,
 NEC with its 38 kHz carrier, RC-5 at 1.778 ms a bit, CEC at 2.4 ms a bit). LIN also has a test
 at the real 19200 bit/s. A faster test is the harder one for the firmware, since its fixed instruction
-counts take a larger share of each bit.
+counts take a larger share of each bit. The USB keyboard runs at the real 1.5 Mbit/s from a
+48 MHz clock; only the waits between transfers are shorter than a real host's (a 20 us bus reset
+instead of 10 ms, which the device sees after 4 us; key polls 200 us apart instead of 10 ms).
 
 ## What I got wrong, and what the tests found
 
@@ -69,6 +72,20 @@ counts take a larger share of each bit.
   to a uio pad, and `docs/isa.md` now says so.
 - My JTAG monitor's first output format could not be decoded: data words could have bit 15 set,
   the same bit that marks the end of a scan. Data words now carry 15 bits.
+- USB: only engines 0 and 1 have a fabric and a CRC unit, which I had forgotten until I planned
+  a third USB engine. The device is two engines.
+- USB: the TX idle bit in BSTAT is already set right after the tick that sends the last bit,
+  so my first ACK ended one bit early. Every packet now ends with a 1-bit word behind its last
+  real one, which the program never shows: when the shifter takes it, the program knows the
+  packet is over or that a stuffed bit still has to go out.
+- USB: a handshake after a data packet went out with CRC bits instead of its PID, because the
+  CRC unit's send mode was still on. Every packet now sets the CRC mode before it starts.
+- USB: after a STALL, the next request's first IN still got the STALL. The processor clears it
+  over the SPI port, which is slower than the host's next IN. A good SETUP now clears whatever
+  endpoint 0 held, on the chip, as USB wants.
+- USB, in my test models rather than the chip: my host started its next packet the cycle after
+  the device's end of packet (USB wants 2 bit times of idle), and my board processor let a key
+  report sit in the only transmit buffer while endpoint 0 needed it, which deadlocked.
 
 ## Decoder limits found on the way
 

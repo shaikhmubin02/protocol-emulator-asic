@@ -40,8 +40,9 @@ After the RTL freeze (tag `rtl-freeze-2026-11-26`) the hardware stays as it is, 
 are firmware and fabric configurations only: CAN 2.0 receive and transmit, HDLC, DALI, MIDI,
 DMX512, LIN with an auto-baud responder, a JTAG TAP, controller and monitor, an SWD host, S/PDIF
 transmit (biphase-mark, a coding the chip was not designed with, done in the fabric), NEC and
-RC-5 infrared, Wiegand, PS/2 keyboard and host, Modbus RTU, HDMI-CEC, and AX.25 packet radio
-(APRS) with Bell 202 audio on three engines. `docs/post-freeze/results.md` has each one next to
+RC-5 infrared, Wiegand, PS/2 keyboard and host, Modbus RTU, HDMI-CEC, AX.25 packet radio
+(APRS) with Bell 202 audio on three engines, and a USB low-speed keyboard on two engines that a
+host written from the USB 2.0 specification enumerates and reads key presses from. `docs/post-freeze/results.md` has each one next to
 the prediction I wrote before the freeze, what went wrong on the way, and the decoder limits
 found.
 
@@ -85,8 +86,8 @@ separately in OCaml, and most of the testing compares the two:
 - An outside check: the protocol tests can record the RTL's pins as waveforms, and
   `scripts/sigrok_check.sh` decodes them with the standard sigrok protocol decoders (UART, SPI,
   I2C, 1-Wire, WS2812, USB, and after the freeze CAN, MIDI, DMX512, LIN, JTAG, SWD, NEC, RC-5,
-  S/PDIF, Wiegand, PS/2, Modbus, CEC, DALI). All 58 decoded fields agree with what the tests
-  sent and received.
+  S/PDIF, Wiegand, PS/2, Modbus, CEC, DALI, and the USB keyboard's whole enumeration). All 60
+  decoded fields agree with what the tests sent and received.
 - cocotb tests in `test/` that drive the chip only through its pins, as the board will.
 - Unmodified Linux software on the other end (`sim/`): the whole chip's RTL under Verilator,
   driven through its pins. OpenOCD scans `jtag_tap.s` through its remote_bitbang driver and finds

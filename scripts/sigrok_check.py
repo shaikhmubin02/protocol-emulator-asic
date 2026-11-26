@@ -26,7 +26,8 @@ def last_hex(line):
 
 
 def usb_packet(line, key):
-    m = re.match(r"(\w+)(?: \[ ([0-9A-F ]*) \])?$", line)
+    # "DATA0 [ 80 06 ]", and "DATA1 [ ]" for an empty one
+    m = re.match(r"(\w+)(?: \[ ?([0-9A-F ]*?) ?\])?$", line)
     if not m or m.group(1) not in USB_PIDS:
         return []
     if key == "pids":
@@ -233,6 +234,9 @@ CASES = {
     "usb_rx": (USB, [(k, "usb_packet=packet", lambda l, k=k: usb_packet(l, k))
                      for k in ("pids", "data")]),
     # after the RTL freeze
+    # the whole enumeration of the USB keyboard: the host's packets and the chip's answers
+    "usb_dev": (USB, [(k, "usb_packet=packet", lambda l, k=k: usb_packet(l, k))
+                      for k in ("pids", "data")]),
     "can_rx": (["can:can_rx=ui3:nominal_bitrate=500000"],
                [("id", "can=id", can_id), ("data", "can=sof:rtr:data", can_data())]),
     "can_tx": (["can:can_rx=ui3:nominal_bitrate=500000"],

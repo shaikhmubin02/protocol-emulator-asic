@@ -21,15 +21,17 @@ FW = os.path.join(ROOT, "hw", "firmware")
 ASM = os.path.join(ROOT, "hw", "_build", "default", "bin", "asm.exe")
 # test_post.ml: the protocols written after the freeze; each test there runs the RTL in lockstep
 # with the model against a model of the other end, so it counts in both columns
-MODEL_TESTS = ["test_protocols.ml", "test_targets.ml", "test_ethernet.ml", "test_post.ml", "test_post2.ml"]
-LOCKSTEP_TESTS = ["test_lockstep.ml", "test_post.ml", "test_post2.ml"]
+MODEL_TESTS = ["test_protocols.ml", "test_targets.ml", "test_ethernet.ml", "test_post.ml", "test_post2.ml",
+               "test_usb.ml"]
+LOCKSTEP_TESTS = ["test_lockstep.ml", "test_post.ml", "test_post2.ml", "test_usb.ml"]
 DESIGNED_FOR = {"uart", "spi_master", "spi_target", "i2c_master", "i2c_target", "ws2812",
                 "onewire", "usb_tx", "usb_rx", "eth_tx", "eth_rx"}
 # recordings whose name is not a firmware's: the test that makes each one runs these programs
 SIGROK_RECORDINGS = {"jtag": ["jtag_host", "jtag_tap", "jtag_mon"], "swd": ["swd_host"],
-                     "spdif": ["spdif_tx"], "wiegand": ["wiegand_tx"], "rc5": ["rc5_rx"]}
+                     "spdif": ["spdif_tx"], "wiegand": ["wiegand_tx"], "rc5": ["rc5_rx"],
+                     "usb_dev": ["usb_dev_rx", "usb_dev_tx"]}
 # files with SAT proofs of fabric configurations
-PROOF_TESTS = ["test_bitstream_proof.ml", "test_post.ml", "test_post2.ml"]
+PROOF_TESTS = ["test_bitstream_proof.ml", "test_post.ml", "test_post2.ml", "test_usb.ml"]
 # test name fragments that mean "checked against limits from the specification"
 SPEC_WORDS = re.compile(r"spec timing|\+-1\.5%|ppm|jitter|tolerance|fastest|802\.3|written from|acknowledged", re.I)
 
@@ -70,7 +72,7 @@ def fabric_pairs(body):
     for c in re.findall(r"Lockstep\.create\s*~fabric:\(" + CFG, body):
         pairs |= {(c, f) for f in files}
     cfg_engine = dict((e, c) for e, c in re.findall(r"config (\d) \(" + CFG, body))
-    for e, f in re.findall(r'load t (\d) \(asm "([a-z0-9_]+)\.s"\)', body):
+    for e, f in re.findall(r'load \w+ (\d) \((?:asm|load) "([a-z0-9_]+)\.s"\)', body):
         if e in cfg_engine:
             pairs.add((cfg_engine[e], f))
     return pairs
