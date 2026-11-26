@@ -29,18 +29,19 @@ How each one is checked:
 | S/PDIF transmit | fits at 48 kHz, not at 96 kHz | works at 48 kHz: biphase-mark, a coding none of the designed-for configurations has, in a 3-element fabric configuration (proved), with the preambles sent in its raw mode; a whole 192-frame block read by a receiver written from IEC 60958: preambles, every sample, parity, the biphase rule, the channel status bytes; 48,007.7 frames a second from a 50 MHz clock. 96 kHz not tried yet | 76, plus the fabric configuration | agrees from the second subframe on (decoder limits below) |
 | NEC infrared transmit and receive | fits; receive times long pulses with counted loops | works: the fabric makes the 38 kHz carrier (proved) and the program turns it on and off at exact times; frames, extended addresses and repeat codes 108 ms apart, read by a receiver model; the receiver reads remotes running 10% slow and 20% fast and reports a frame that breaks off | 62 and 73, plus the fabric configuration | agrees on the addresses and on the commands of the standard frames (decoder limit below) |
 | Wiegand 26/34 | fits | works at 20 us pulses 200 us apart (the shortest the interface allows): 26-bit and 34-bit cards with their parity bits, and a receiver that ignores a 0.8 us glitch and takes messages of any length up to 48 bits | 77 and 48 | agrees |
+| RC-5 infrared transmit and receive | fits, on half-bit ticks | works: the same carrier configuration at 36 kHz, Manchester bits on deadlines, the toggle bit kept across held keys, the RC-5X seventh command bit; the receiver finds each bit by the edge in its middle and reads remotes 10% slow and 10% fast, and reports a frame that breaks off | 64 and 56 | agrees, including the RC-5X command |
 
-Not attempted yet from the planned list: AX.25/APRS, RC-5, PS/2 device and host, HDMI-CEC,
-Modbus RTU, USB low speed HID enumeration.
+Not attempted yet from the planned list: AX.25/APRS, PS/2 device and host, HDMI-CEC, Modbus RTU,
+USB low speed HID enumeration.
 
 ## Rates
 
-CAN, HDLC, DMX512, MIDI, JTAG, SWD, S/PDIF and Wiegand run at their real rates in the tests. DALI and NEC
-run 100 times faster and LIN 10 times faster, to keep the cycle-by-cycle runs short; their
-recordings are written with the real timing, so the decoders read them at the real rates (DALI
-at 1200 bit/s, LIN at 19200 bit/s, NEC with its 38 kHz carrier). LIN also has a test at the
-real 19200 bit/s. A faster test is the harder one for the firmware, since its fixed
-instruction counts take a larger share of each bit.
+CAN, HDLC, DMX512, MIDI, JTAG, SWD, S/PDIF and Wiegand run at their real rates in the tests.
+DALI, NEC and RC-5 run 100 times faster and LIN 10 times faster, to keep the cycle-by-cycle runs
+short; their recordings are written with the real timing, so the decoders read them at the real
+rates (DALI at 1200 bit/s, LIN at 19200 bit/s, NEC with its 38 kHz carrier, RC-5 at 1.778 ms a
+bit). LIN also has a test at the real 19200 bit/s. A faster test is the harder one for the
+firmware, since its fixed instruction counts take a larger share of each bit.
 
 ## What I got wrong, and what the tests found
 

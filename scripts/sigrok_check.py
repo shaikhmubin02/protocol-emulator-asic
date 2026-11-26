@@ -177,6 +177,12 @@ def wiegand_bits(line):
     return [int(c) for c in m.group(1)] if m else []
 
 
+def rc5(line):
+    # "Address: 5 (...)", "Command: 53 (...)": address and command in turn
+    m = re.match(r"(?:Address|Command): (\d+)", line)
+    return [int(m.group(1))] if m else []
+
+
 def spi(clk, mosi, cs, miso, mode):
     return [f"spi:clk={clk}:mosi={mosi}:cs={cs}:miso={miso}:cpol={mode >> 1}:cpha={mode & 1}"]
 
@@ -226,6 +232,8 @@ CASES = {
                 for k in ("addresses", "commands")]),
     "spdif": (["spdif:data=uo0"], [("audio", "spdif=samples", first_audio(8))]),
     "wiegand": (["wiegand:d0=uio0:d1=uio1:bitwidth_ms=1"], [("bits", "wiegand=state", wiegand_bits)]),
+    "rc5": (["ir_rc5:ir=ui3:polarity=active-low:protocol=extended"],
+            [("frames", "ir_rc5=address:command", rc5)]),
     "dali": (["dali:dali=ui3"],
              [(k, "dali=address:command:reply", lambda l, k=k: dali(l, k)) for k in ("data", "reply")]),
 }

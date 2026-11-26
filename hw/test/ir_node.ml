@@ -109,3 +109,68 @@ let to_string = function
     then sprintf "extended address %04x, command %02x" (v land 0xFFFF) (b 2)
     else sprintf "code %08x (command check failed)" v
 ;;
+
+(* ---- Philips RC-5 (with the RC-5X seventh command bit): 14 bits of 1.778 ms (4 quarters),
+   Manchester: a 1 is a space then a mark, a 0 a mark then a space. S1 = 1, S2 = the inverse of
+   command bit 6, T (toggles on a new key press), 5 address bits, 6 command bits, MSB first. A
+   held key repeats the frame every 64 bits. *)
+let rc5_bits ~address ~command ~toggle =
+  [ 1; 1 - ((command lsr 6) land 1); toggle ]
+  @ List.init 5 ~f:(fun k -> (address lsr (4 - k)) land 1)
+  @ List.init 6 ~f:(fun k -> (command lsr (5 - k)) land 1)
+;;
+
+(* the receiver's output (low = mark) for frames of bits; [stretch] makes the remote slow or
+   fast; [cut] stops the last frame after that many bits *)
+let rc5_line ~quarter ?(stretch = 1.0) ?cut frames =
+  let q n = Float.iround_nearest_exn (Float.of_int n *. quarter *. stretch) in
+  let last = List.length frames - 1 in
+  let runs =
+    List.concat_mapi frames ~f:(fun i bits ->
+      let bits = if i = last then Option.value_map cut ~default:bits ~f:(List.take bits) else bits in
+      let halves = List.concat_map bits ~f:(fun b -> if b = 1 then [ 1; 0 ] else [ 0; 1 ]) in
+      List.map halves ~f:(fun l -> l, q 2) @ [ 1, q (256 - (4 * List.length bits)) ])
+  in
+  Array.concat (Array.create ~len:2000 1 :: List.map runs ~f:(fun (l, n) -> Array.create ~len:n l))
+;;
+
+(* read the receiver's output the way the format defines a bit: by the edge in its middle,
+   expected a bit after the last middle (between three quarters and five quarters of a bit) *)
+let rc5_decode samples ~quarter =
+  let t = 4. *. quarter in
+  let n = Array.length samples in
+  let rec change_after i = if i + 1 >= n then None else if samples.(i + 1) <> samples.(i) then Some (i + 1) else change_after (i + 1) in
+  let rec frames i acc =
+    (* idle high, then the falling middle of S1 *)
+    match change_after i with
+    | None -> List.rev acc
+    | Some j when samples.(j) = 0 ->
+      let rec bits m k got =
+        if k = 13
+        then Some (List.rev got, m)
+        else (
+          let from = m + Float.iround_nearest_exn (0.75 *. t) in
+          match change_after from with
+          | Some e ->
+            let d = Float.of_int (e - m) in
+            if Float.(d <= 1.25 * t)
+            then bits e (k + 1) ((if samples.(e) = 0 then 1 else 0) :: got)
+            else None
+          | None -> None)
+      in
+      (match bits j 0 [ 1 ] with
+       | Some (b, m) -> frames (m + Float.iround_nearest_exn t) (b :: acc)
+       | None -> frames j acc)
+    | Some j -> frames j acc
+  in
+  frames 0 []
+;;
+
+let rc5_to_string bits =
+  let v l = List.fold l ~init:0 ~f:(fun a b -> (a lsl 1) lor b) in
+  match bits with
+  | [ _s1; s2; t; a4; a3; a2; a1; a0; c5; c4; c3; c2; c1; c0 ] ->
+    sprintf "address %d, command %d, T %d" (v [ a4; a3; a2; a1; a0 ])
+      (v [ 1 - s2; c5; c4; c3; c2; c1; c0 ]) t
+  | _ -> sprintf "%d bits" (List.length bits)
+;;

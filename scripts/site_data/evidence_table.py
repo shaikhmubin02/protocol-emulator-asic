@@ -21,8 +21,8 @@ FW = os.path.join(ROOT, "hw", "firmware")
 ASM = os.path.join(ROOT, "hw", "_build", "default", "bin", "asm.exe")
 # test_post.ml: the protocols written after the freeze; each test there runs the RTL in lockstep
 # with the model against a model of the other end, so it counts in both columns
-MODEL_TESTS = ["test_protocols.ml", "test_targets.ml", "test_ethernet.ml", "test_post.ml"]
-LOCKSTEP_TESTS = ["test_lockstep.ml", "test_post.ml"]
+MODEL_TESTS = ["test_protocols.ml", "test_targets.ml", "test_ethernet.ml", "test_post.ml", "test_post2.ml"]
+LOCKSTEP_TESTS = ["test_lockstep.ml", "test_post.ml", "test_post2.ml"]
 DESIGNED_FOR = {"uart", "spi_master", "spi_target", "i2c_master", "i2c_target", "ws2812",
                 "onewire", "usb_tx", "usb_rx", "eth_tx", "eth_rx"}
 # test name fragments that mean "checked against limits from the specification"
