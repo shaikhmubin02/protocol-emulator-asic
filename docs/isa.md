@@ -51,13 +51,15 @@ Pin numbers are 5 bits.
 | p | Pin | Drive | Read |
 |---|---|---|---|
 | 0 to 7 | uio[0..7] | push-pull, or released (`HIZ`) | the pad, through the synchroniser |
-| 8 to 14 | uo[0..6] | push-pull only (`HIZ` drives 0) | the output register |
+| 8 to 14 | uo[0..6] | push-pull only (`HIZ` drives 0) | the engine's own output register |
 | 15 | uo[7] | the host port's MISO: writes are ignored | 0 |
 | 16 to 23 | ui[0..7] | inputs: writes are ignored | the pad, through the synchroniser (ui[0..2] are the host port) |
 | 24 to 31 | none | writes are ignored | 0 |
 
 An engine only changes a pin the host has given it (pin owners, info.md). A write to a pin it
-doesn't own takes its normal cycles and changes nothing. Every engine can read every pin.
+doesn't own takes its normal cycles and changes nothing. Every engine can read every pin, but a
+uo pin reads back the engine's own output register, not what another engine drives there: one
+engine sees another's output only on a uio pad (or through the event flags).
 Open drain (I2C, 1-Wire) is `CLR` to pull low and `HIZ` to let go.
 
 Pin groups: each engine has 4 groups, each a run of 1 to 8 pins set by a CSR (base pin, count).
