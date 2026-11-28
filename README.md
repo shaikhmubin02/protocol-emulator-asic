@@ -7,6 +7,8 @@ each a processor whose instructions read and write pins and count cycles, so pro
 UART, SPI and I2C are done in software instead of fixed hardware. The engines can run different
 protocols at the same time, and the host loads them over SPI.
 
+![The chip: a host port, four engines (two with a LUT fabric and a CRC unit), shared time and flags, and pins with one owner each](docs/figures/chip_blocks.svg)
+
 This is my entry for the Jane Street protocol emulator ASIC competition. The datasheet with the
 address map and the firmware list is in [docs/info.md](docs/info.md), and the instruction set
 is in [docs/isa.md](docs/isa.md). [docs/reviewer-guide.md](docs/reviewer-guide.md) lists every claim

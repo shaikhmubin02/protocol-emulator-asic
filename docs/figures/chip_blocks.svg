@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 600" width="980" height="600" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <rect width="980" height="600" fill="#ffffff"/>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#555"/>
+    </marker>
+  </defs>
+
+  <!-- host -->
+  <rect x="12" y="245" width="104" height="90" rx="8" fill="#f2f2f2" stroke="#888"/>
+  <text x="64" y="282" text-anchor="middle" font-weight="bold">Host</text>
+  <text x="64" y="300" text-anchor="middle" font-size="12">board</text><text x="64" y="316" text-anchor="middle" font-size="12">processor</text>
+
+  <line x1="116" y1="275" x2="198" y2="275" stroke="#555" marker-end="url(#a)"/>
+  <text x="157" y="266" text-anchor="middle" font-size="10">SCK CSn MOSI</text>
+  <line x1="198" y1="305" x2="116" y2="305" stroke="#555" marker-end="url(#a)"/>
+  <text x="157" y="322" text-anchor="middle" font-size="10">MISO</text>
+
+  <!-- host port -->
+  <rect x="200" y="40" width="190" height="520" rx="8" fill="#f7f7fb" stroke="#888"/>
+  <text x="295" y="64" text-anchor="middle" font-weight="bold">Host port (SPI)</text>
+  <text x="295" y="82" text-anchor="middle" font-size="11">ui[0..2] in, uo[7] out</text>
+  <text x="212" y="112" font-weight="bold" font-size="12">for each engine</text>
+  <text x="212" y="134">program memory</text>
+  <text x="212" y="152" font-size="11" fill="#555">written while stopped</text>
+  <text x="212" y="176">fabric and CRC setup</text>
+  <text x="212" y="194" font-size="11" fill="#555">engines 0 and 1</text>
+  <text x="212" y="218">status, registers</text>
+  <text x="212" y="242">mailbox</text>
+  <text x="212" y="260" font-size="11" fill="#555">2 words each way</text>
+  <text x="212" y="284">debugger</text>
+  <text x="212" y="302" font-size="11" fill="#555">stop, step, resume,</text>
+  <text x="212" y="318" font-size="11" fill="#555">breakpoint, registers</text>
+  <text x="212" y="360" font-weight="bold" font-size="12">for the chip</text>
+  <text x="212" y="382">pin owners</text>
+  <text x="212" y="404">run (one bit an engine)</text>
+  <text x="212" y="426">event flags</text>
+  <text x="212" y="448">cycle counter</text>
+  <text x="212" y="470">stop / resume / step,</text>
+  <text x="212" y="488">several engines at once</text>
+
+  <!-- engines -->
+  <g>
+    <rect x="430" y="40" width="300" height="108" rx="8" fill="#e8f0fe" stroke="#5b7fc7"/>
+    <text x="442" y="62" font-weight="bold">Engine 0</text>
+    <text x="442" y="84">processor: 8 x 16-bit registers</text>
+    <text x="442" y="102">program: 256 x 16 SRAM</text>
+    <text x="442" y="120">bit engine: baud, TX, RX</text>
+    <rect x="636" y="50" width="86" height="88" rx="6" fill="#fff1d6" stroke="#d29a2e"/>
+    <text x="679" y="78" text-anchor="middle" font-size="12" font-weight="bold">LUT fabric</text>
+    <text x="679" y="95" text-anchor="middle" font-size="11">8 x LUT4</text>
+    <text x="679" y="118" text-anchor="middle" font-size="12" font-weight="bold">CRC unit</text>
+    <text x="679" y="133" text-anchor="middle" font-size="11">up to 32 bits</text>
+  </g>
+  <g>
+    <rect x="430" y="160" width="300" height="108" rx="8" fill="#e8f0fe" stroke="#5b7fc7"/>
+    <text x="442" y="182" font-weight="bold">Engine 1</text>
+    <text x="442" y="204">processor: 8 x 16-bit registers</text>
+    <text x="442" y="222">program: 256 x 16 SRAM</text>
+    <text x="442" y="240">bit engine: baud, TX, RX</text>
+    <rect x="636" y="170" width="86" height="88" rx="6" fill="#fff1d6" stroke="#d29a2e"/>
+    <text x="679" y="198" text-anchor="middle" font-size="12" font-weight="bold">LUT fabric</text>
+    <text x="679" y="215" text-anchor="middle" font-size="11">8 x LUT4</text>
+    <text x="679" y="238" text-anchor="middle" font-size="12" font-weight="bold">CRC unit</text>
+    <text x="679" y="253" text-anchor="middle" font-size="11">up to 32 bits</text>
+  </g>
+  <g>
+    <rect x="430" y="280" width="300" height="84" rx="8" fill="#e8f0fe" stroke="#5b7fc7"/>
+    <text x="442" y="302" font-weight="bold">Engine 2</text>
+    <text x="442" y="324">processor, 256 x 16 SRAM</text>
+    <text x="442" y="342">bit engine (no fabric, no CRC unit)</text>
+  </g>
+  <g>
+    <rect x="430" y="376" width="300" height="84" rx="8" fill="#e8f0fe" stroke="#5b7fc7"/>
+    <text x="442" y="398" font-weight="bold">Engine 3</text>
+    <text x="442" y="420">processor, 256 x 16 SRAM</text>
+    <text x="442" y="438">bit engine (no fabric, no CRC unit)</text>
+  </g>
+
+  <!-- host port to engines -->
+  <line x1="390" y1="94" x2="428" y2="94" stroke="#555" marker-end="url(#a)"/>
+  <line x1="390" y1="214" x2="428" y2="214" stroke="#555" marker-end="url(#a)"/>
+  <line x1="390" y1="322" x2="428" y2="322" stroke="#555" marker-end="url(#a)"/>
+  <line x1="390" y1="418" x2="428" y2="418" stroke="#555" marker-end="url(#a)"/>
+
+  <!-- shared -->
+  <rect x="430" y="474" width="300" height="86" rx="8" fill="#eaf6ea" stroke="#5a9a5a"/>
+  <text x="442" y="496" font-weight="bold">Shared by all engines</text>
+  <text x="442" y="516">32-bit cycle counter, the same in all</text>
+  <text x="442" y="534">8 event flags: SIG seen everywhere next cycle</text>
+  <text x="442" y="552">breakpoint join: stop in the same cycle</text>
+
+  <!-- pins -->
+  <rect x="770" y="40" width="190" height="520" rx="8" fill="#f7f7fb" stroke="#888"/>
+  <text x="865" y="64" text-anchor="middle" font-weight="bold">Pins</text>
+  <text x="782" y="94">15 pins, each with one</text>
+  <text x="782" y="112">owner engine, set by</text>
+  <text x="782" y="130">the host</text>
+  <text x="782" y="168" font-weight="bold" font-size="12">outputs</text>
+  <text x="782" y="190">uio[7:0]: drive or let go</text>
+  <text x="782" y="208">uo[6:0]: drive</text>
+  <text x="782" y="246" font-weight="bold" font-size="12">inputs</text>
+  <text x="782" y="268">uio[7:0], ui[7:3]</text>
+  <text x="782" y="286">through 2 flops, seen</text>
+  <text x="782" y="304">by every engine</text>
+  <text x="782" y="342" font-weight="bold" font-size="12">timing</text>
+  <text x="782" y="364">a PIN write in cycle t</text>
+  <text x="782" y="382">is on the pad in t+1</text>
+
+  <line x1="730" y1="94" x2="768" y2="94" stroke="#555" marker-end="url(#a)" marker-start="url(#a)"/>
+  <line x1="730" y1="214" x2="768" y2="214" stroke="#555" marker-end="url(#a)" marker-start="url(#a)"/>
+  <line x1="730" y1="322" x2="768" y2="322" stroke="#555" marker-end="url(#a)" marker-start="url(#a)"/>
+  <line x1="730" y1="418" x2="768" y2="418" stroke="#555" marker-end="url(#a)" marker-start="url(#a)"/>
+</svg>
