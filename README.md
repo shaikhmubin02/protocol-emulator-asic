@@ -12,6 +12,8 @@ address map and the firmware list is in [docs/info.md](docs/info.md), and the in
 is in [docs/isa.md](docs/isa.md). [docs/reviewer-guide.md](docs/reviewer-guide.md) lists every claim
 with the command that checks it, and [docs/verification.md](docs/verification.md) explains each
 layer of checking: what it caught, what it misses, and how to make it fail.
+[docs/programming.md](docs/programming.md) goes from a first program to a protocol with its own
+line coding.
 
 The RTL was frozen on 2026-11-26 (git tag `rtl-freeze-2026-11-26`). Everything added after
 that is firmware and configuration on the same hardware. Before the freeze I published the list
