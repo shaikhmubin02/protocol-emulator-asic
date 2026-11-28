@@ -120,7 +120,7 @@ timed out.
 | 4 | not C | 12 | flag JFLAG set |
 | 5 | T | 13 | flag JFLAG clear |
 | 6 | not T | 14 | the fabric's flag output |
-| 7 | pin JPIN high | 15 | never |
+| 7 | pin JPIN high | 15 | not a condition: the assembler has no name for it and the model rejects it (the RTL never jumps) |
 
 ### 4.3 PIN
 

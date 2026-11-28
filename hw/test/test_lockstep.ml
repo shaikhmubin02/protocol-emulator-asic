@@ -309,6 +309,133 @@ let%expect_test "call stack at full depth and past it, in lockstep" =
     |}]
 ;;
 
+(* TIME_HI holds the high half of the counter as it was when TIME_LO was read, until TIME_LO is
+   read again. Random programs never run long enough for the high half to change between the two
+   reads, and three mutants that latch TIME_HI on other instructions survived because of it. Here
+   the counter crosses 0x10000 between the reads, with a read of another CSR and instructions
+   whose low 6 bits are 0 (the address of TIME_LO) in between. *)
+let%expect_test "TIME_HI keeps the half latched by the TIME_LO read across a 16-bit wrap, in lockstep" =
+  let source =
+    {|
+      ldi  r2, 0
+      ldih r2, 0x40
+      wait time r2     ; 0x4000: a deadline is at most half the 16-bit range ahead, so
+      ldih r2, 0x80    ; the counter gets to 0xFFF0 in steps
+      wait time r2
+      ldih r2, 0xC0
+      wait time r2
+      ldi  r2, 0xF0
+      ldih r2, 0xFF
+      wait time r2     ; TIME_LO = 0xFFF0
+      csrr r0, time_lo ; latches TIME_HI = 0
+      ldi  r3, 0x20
+      wait time r3     ; past the wrap: TIME_LO = 0x0020, the high half is now 1
+      nop
+      ldi  r4, 0
+      csrr r7, flags   ; another CSR read: it must not latch TIME_HI either
+      nop
+      csrr r1, time_hi ; still the half latched above: 0
+      csrr r5, time_lo
+      csrr r6, time_hi ; latched again: 1
+stop: jmp  stop
+|}
+  in
+  let program =
+    match Asm.assemble source with
+    | Ok w -> w
+    | Error e -> failwith e
+  in
+  let ls = Lockstep.create program in
+  for _ = 1 to 65_700 do
+    ignore (Lockstep.step ls Model.Pads.zero : int option * bool)
+  done;
+  let r = ls.model.regs in
+  printf "TIME_LO read at %04x; TIME_HI after the wrap: %d; after another TIME_LO read (%04x): %d\n"
+    r.(0) r.(1) r.(5) r.(6);
+  [%expect {| TIME_LO read at fff1; TIME_HI after the wrap: 0; after another TIME_LO read (0026): 1 |}]
+;;
+
+(* A word goes into a mailbox in the same cycle another comes out, while it holds a word: the
+   engine pushes on consecutive cycles while the host reads, and the host writes on consecutive
+   cycles while the engine pulls. A mutant that dropped the word pushed in such a cycle survived
+   every other test: nothing did both in one cycle. The counts before and after each cycle show
+   how often it happens here. *)
+let%expect_test "mailboxes with a push and a pop in the same cycle, in lockstep" =
+  let asm src =
+    match Asm.assemble src with
+    | Ok w -> w
+    | Error e -> failwith e
+  in
+  let count ls f = Lockstep.get (f ls.Lockstep.o) in
+  (* the outbox: four pushes in a row, the host reading whenever there is a word, except one
+     cycle in seven, so the outbox also fills up and a push has to wait *)
+  let ls =
+    Lockstep.create
+      (asm
+         {|
+      ldi  r0, 0
+      ldi  r1, 1
+      ldi  r2, 2
+      ldi  r3, 3
+loop: push r0
+      push r1
+      push r2
+      push r3
+      addi r0, 4
+      addi r1, 4
+      addi r2, 4
+      addi r3, 4
+      jmp  loop
+|})
+  in
+  let got = ref []
+  and both = ref 0 in
+  for c = 1 to 3000 do
+    let before = count ls (fun o -> o.Engine.O.outbox_count) in
+    let read, _ = Lockstep.step ~receive:(c % 7 <> 0) ls Model.Pads.zero in
+    let after = count ls (fun o -> o.Engine.O.outbox_count) in
+    Option.iter read ~f:(fun w -> got := w :: !got);
+    (* a pop and a push in one cycle leave the count where it was *)
+    if Option.is_some read && before >= 1 && after = before then incr both
+  done;
+  let words = List.rev !got in
+  printf "outbox: %d words read, in order: %b; %d cycles with a push and a pop together\n"
+    (List.length words) ([%equal: int list] words (List.init (List.length words) ~f:Fn.id)) !both;
+  (* the inbox: the host writes a new word every cycle it can, the engine pulls four in a row
+     and adds them up; the registers are compared with the model every cycle *)
+  let ls =
+    Lockstep.create
+      (asm
+         {|
+loop: pull r0
+      pull r1
+      pull r2
+      pull r3
+      add  r4, r0
+      add  r4, r1
+      add  r4, r2
+      add  r4, r3
+      jmp  loop
+|})
+  in
+  let next = ref 1
+  and both = ref 0 in
+  for c = 1 to 3000 do
+    let before = count ls (fun o -> o.Engine.O.inbox_count) in
+    let send = if c % 5 = 0 then None else Some !next in
+    let _, wrote = Lockstep.step ?send ls Model.Pads.zero in
+    let after = count ls (fun o -> o.Engine.O.inbox_count) in
+    if wrote then incr next;
+    if wrote && before >= 1 && after = before then incr both
+  done;
+  printf "inbox: %d words written, the engine's sum %d; %d cycles with a push and a pop together\n"
+    (!next - 1) ls.model.regs.(4) !both;
+  [%expect {|
+    outbox: 1284 words read, in order: true; 856 cycles with a push and a pop together
+    inbox: 1202 words written, the engine's sum 65240; 603 cycles with a push and a pop together
+    |}]
+;;
+
 let%expect_test "random programs on a lite engine (no fabric, no CRC)" =
   let programs = 150 in
   for seed = 1001 to 1000 + programs do

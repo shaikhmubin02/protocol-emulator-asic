@@ -256,3 +256,156 @@ let%expect_test "a USB keyboard: enumerated by a host written from the USB 2.0 s
       5847208 ns: CRC-16 wrong
     |}]
 ;;
+
+(* ---- a PS/2-to-USB keyboard adapter on one chip: ps2_host.s on engine 2 reads a PS/2 keyboard
+   (the model from the PS/2 tests), the board processor turns its scan codes (set 2) into boot
+   keyboard reports, and engines 0 and 1 are the USB keyboard a host reads them from. *)
+
+(* scan code set 2 -> HID usage, for the keys typed here *)
+let set2_to_usage =
+  List.zip_exn
+    [ 0x1C; 0x32; 0x21; 0x23; 0x24; 0x2B; 0x34; 0x33; 0x43; 0x3B; 0x42; 0x4B; 0x3A; 0x31; 0x44; 0x4D
+    ; 0x15; 0x2D; 0x1B; 0x2C; 0x3C; 0x2A; 0x1D; 0x22; 0x35; 0x1A ]
+    (List.init 26 ~f:(fun k -> 0x04 + k))
+  @ [ 0x29, 0x2C (* space *); 0x5A, 0x28 (* enter *) ]
+;;
+
+let usage_to_char u =
+  if u >= 0x04 && u <= 0x1D
+  then Some (Char.of_int_exn (Char.to_int 'a' + u - 0x04))
+  else if u = 0x2C
+  then Some ' '
+  else None
+;;
+
+let%expect_test "a PS/2-to-USB keyboard adapter: a PS/2 keyboard on engine 2, the USB keyboard on engines 0 and 1" =
+  let module H = Chip_host in
+  let module U = Usb_host in
+  let h = H.create () in
+  attach_chip_model h;
+  H.load h 0 (load "usb_dev_rx.s");
+  H.load h 1 (load "usb_dev_tx.s");
+  H.load h 2 (load "ps2_host.s");
+  let config e fabric =
+    Array.iteri fabric ~f:(fun k w -> H.set_config h e ~word:k w);
+    H.set_config h e ~word:16 usb_crc_poly;
+    H.set_config h e ~word:17 usb_crc_init
+  in
+  config 0 (Pemu_post.Fabric_post.usb_rx ~n_le:Model.n_le);
+  config 1 (Bitstream.usb_tx ~n_le:Model.n_le);
+  H.own h ~pin:4 ~engine:1;
+  H.own h ~pin:5 ~engine:1;
+  H.own h ~pin:0 ~engine:2 (* PS/2 clock *);
+  H.own h ~pin:1 ~engine:2 (* PS/2 data *);
+  (* "hi pemu": each key's make code, then F0 and the code again when it is let go *)
+  let typed = "hi pemu" in
+  let codes =
+    String.to_list typed
+    |> List.concat_map ~f:(fun c ->
+      let code =
+        if Char.equal c ' '
+        then 0x29
+        else
+          List.find_map_exn set2_to_usage ~f:(fun (sc, u) ->
+            if u = 0x04 + Char.to_int c - Char.to_int 'a' then Some sc else None)
+      in
+      [ code; 0xF0; code ])
+  in
+  let kb = Ps2_node.Keyboard.create ~q:1000 ~sends:codes in
+  let host = U.create ~clock_hz () in
+  h.uio_ext <- 0x23;
+  h.on_cycle
+  <- (fun h ->
+       let pads = H.uio_pads h in
+       Ps2_node.Keyboard.step kb ~cycle:h.cycle ~clk:(bit pads 0) ~data:(bit pads 1);
+       let drive =
+         U.step host ~dp:(bit pads 4) ~dm:(bit pads 5) ~chip_drives:(H.uio_oe h land 0x30 <> 0)
+       in
+       let usb =
+         match drive with
+         | Some (dp, dm) -> (dp lsl 4) lor (dm lsl 5)
+         | None -> 0x20
+       in
+       (* the keyboard's open-drain levels on uio[0..1], the USB host on uio[4..5] *)
+       h.uio_ext <- usb lor kb.clk lor (kb.data lsl 1));
+  H.run h 0b111;
+  let board = Usb_board.create h in
+  (* the board's PS/2 side: make and break codes -> the keys held -> a report on each change *)
+  let held = ref []
+  and release = ref false
+  and ps2_errors = ref 0 in
+  let scan w =
+    if w land 0xF00 <> 0x100
+    then incr ps2_errors
+    else (
+      let b = w land 0xFF in
+      if b = 0xF0
+      then release := true
+      else (
+        (match List.Assoc.find set2_to_usage b ~equal:Int.equal with
+         | Some u ->
+           held
+           := if !release
+              then List.filter !held ~f:(fun k -> k <> u)
+              else if List.mem !held u ~equal:Int.equal
+              then !held
+              else !held @ [ u ];
+           let keys = List.take (!held @ List.init 6 ~f:(fun _ -> 0)) 6 in
+           board.reports <- board.reports @ [ [ 0; 0 ] @ keys ]
+         | None -> ());
+        release := false))
+  in
+  let addr = 5 in
+  let got = ref []
+  and finished = ref false in
+  let rec poll_keys k =
+    if List.length !got >= 2 * String.length typed
+    then k ()
+    else
+      U.in_retry host ~addr ~ep:1 (fun r ->
+        (match r with
+         | Data (_, d) -> got := d :: !got
+         | r -> U.error host (sprintf !"keyboard: %{sexp:U.result}" r));
+        U.wait host (us 200.) (fun () -> poll_keys k))
+  in
+  U.seq
+    [ (fun k -> U.bus_reset host ~cycles:(us 20.) k)
+    ; (fun k ->
+        U.control_write host ~addr:0 (U.request ~typ:0 ~req:5 ~value:addr ~index:0 ~len:0) (fun _ ->
+          U.wait host (us 50.) k))
+    ; (fun k ->
+        U.control_read host ~addr (U.request ~typ:0x80 ~req:6 ~value:0x0100 ~index:0 ~len:18) (fun r ->
+          (match r with
+           | Done d when [%equal: int list] d Usb_board.device_descriptor -> ()
+           | _ -> U.error host "device descriptor");
+          k ()))
+    ; (fun k -> U.control_write host ~addr (U.request ~typ:0 ~req:9 ~value:1 ~index:0 ~len:0) (fun _ -> k ()))
+    ; poll_keys
+    ; (fun _ -> finished := true)
+    ];
+  while (not !finished) && h.cycle < 4_000_000 && List.is_empty host.errors do
+    Usb_board.poll board;
+    let n = H.outbox_count h 2 in
+    if n > 0 then List.iter (H.read h (H.mailbox 2) n) ~f:scan
+  done;
+  (* what the USB host saw typed: each key that is down in a report and was not in the last *)
+  let text, _ =
+    List.fold (List.rev !got) ~init:("", []) ~f:(fun (s, last) r ->
+      let keys = List.filter (List.drop r 2) ~f:(fun k -> k <> 0) in
+      let fresh = List.filter keys ~f:(fun k -> not (List.mem last k ~equal:Int.equal)) in
+      s ^ String.of_list (List.filter_map fresh ~f:usage_to_char), keys)
+  in
+  printf "the PS/2 keyboard typed %S; the USB host read %S\n" typed text;
+  printf "PS/2 errors: %d, USB answers: %d (%.2f to %.2f bit times), cycles: %d%s\n" !ps2_errors
+    (List.length host.turnarounds)
+    (List.min_elt host.turnarounds ~compare:Float.compare |> Option.value ~default:0.)
+    (List.max_elt host.turnarounds ~compare:Float.compare |> Option.value ~default:0.)
+    h.cycle
+    (if !finished then "" else " (NOT FINISHED)");
+  List.iter (List.take (List.rev host.errors) 5) ~f:(printf "host error: %s\n");
+  List.iter (List.rev host.bus.errors) ~f:(printf "line error: %s\n");
+  [%expect {|
+    the PS/2 keyboard typed "hi pemu"; the USB host read "hi pemu"
+    PS/2 errors: 0, USB answers: 261 (3.50 to 3.69 bit times), cycles: 1085779
+    |}]
+;;

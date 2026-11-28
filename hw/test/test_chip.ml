@@ -232,3 +232,48 @@ let%expect_test "SPI, I2C and UART running at the same time" =
     all three mid-transfer in 9 of 28 busy 1000-cycle windows
     |}]
 ;;
+
+(* A write to a full inbox is dropped (docs/info.md). Every host in the other tests reads the
+   status first and never writes to a full inbox, so two mutants that let such a write through
+   survived them. Here the host writes three words while the engine is not pulling; the engine
+   then pulls with a timeout, and echoes what it got. The whole chip runs in lockstep with the
+   chip model. *)
+let%expect_test "a write to a full inbox is dropped" =
+  let t = H.create () in
+  Post_util.attach_chip_model t;
+  let program =
+    match
+      Asm.assemble
+        {|
+      wait flag 0, 1
+      pull r0
+      pull r1
+      csrwi tmo, 60
+      pull r2          ; the third word was dropped: this times out and r2 stays 0
+      csrwi tmo, 0
+      push r0
+      push r1
+      push r2
+stop: jmp  stop
+|}
+    with
+    | Ok w -> w
+    | Error e -> failwith e
+  in
+  H.load t 0 program;
+  H.run t 1;
+  List.iter [ 0x1111; 0x2222; 0x3333 ] ~f:(fun w -> H.write t (H.mailbox 0) [ w ]);
+  printf "after three writes the inbox holds %d words\n" (H.inbox_count t 0);
+  H.write t H.flags_reg [ 1 ];
+  let got = ref [] in
+  for _ = 1 to 6 do
+    H.cycles t 100;
+    let n = H.outbox_count t 0 in
+    if n > 0 then got := !got @ H.read t (H.mailbox 0) n
+  done;
+  printf "the engine got: %s\n" (String.concat ~sep:" " (List.map !got ~f:(sprintf "%04x")));
+  [%expect {|
+    after three writes the inbox holds 2 words
+    the engine got: 1111 2222 0000
+    |}]
+;;

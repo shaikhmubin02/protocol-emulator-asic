@@ -37,6 +37,7 @@ from the repository root unless they say otherwise.
 |---|---|---|
 | The engine RTL equals the separately written cycle-accurate model every cycle | lockstep on random programs (with and without random debug commands) and on every firmware (`hw/test/test_lockstep.ml`) | `cd hw && dune build @runtest` |
 | The whole chip equals the chip model at its pins every cycle | random programs on all four engines, random pin owners and host traffic over SPI (`hw/test/test_chip_lockstep.ml`) | `cd hw && dune build @runtest` |
+| The tests catch bugs put into the RTL on purpose | 497 mutants (one operator or constant changed each) built and run against the lockstep tests and the proofs: 477 caught at once, 9 gaps found and closed with new tests, 11 argued to change nothing visible, 0 open (`docs/mutation.md`) | `python3 scripts/mutate.py run --sample 20` |
 | The ALU matches the instruction set for every input; each fabric configuration computes what it is meant to | SAT proofs (`hw/test/test_alu_proof.ml`, `hw/test/test_bitstream_proof.ml`) | `cd hw && dune build @runtest` |
 
 ## Protocols

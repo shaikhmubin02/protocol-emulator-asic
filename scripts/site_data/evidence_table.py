@@ -43,7 +43,8 @@ def read(path):
 
 def expect_tests(path):
     """(name, body) of every expect test in a file."""
-    return re.findall(r'let%expect_test "([^"]+)"(.*?)(?=let%expect_test|\Z)', read(path), re.S)
+    # a test ends at its ";;" at the start of a line, so comments and helpers after it don't count
+    return re.findall(r'let%expect_test "([^"]+)"(.*?)(?=^;;$|\Z)', read(path), re.S | re.M)
 
 
 def tests_mentioning(path, name, bodies=False):

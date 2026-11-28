@@ -42,7 +42,8 @@ DMX512, LIN with an auto-baud responder, a JTAG TAP, controller and monitor, an 
 transmit (biphase-mark, a coding the chip was not designed with, done in the fabric), NEC and
 RC-5 infrared, Wiegand, PS/2 keyboard and host, Modbus RTU, HDMI-CEC, AX.25 packet radio
 (APRS) with Bell 202 audio on three engines, and a USB low-speed keyboard on two engines that a
-host written from the USB 2.0 specification enumerates and reads key presses from. `docs/post-freeze/results.md` has each one next to
+host written from the USB 2.0 specification enumerates and reads key presses from (with a PS/2
+keyboard on a third engine, the chip is a PS/2-to-USB keyboard adapter). `docs/post-freeze/results.md` has each one next to
 the prediction I wrote before the freeze, what went wrong on the way, and the decoder limits
 found.
 
@@ -59,7 +60,10 @@ separately in OCaml, and most of the testing compares the two:
 - Lockstep: the RTL and the model run side by side and are compared every cycle, on hundreds of
   random programs and on the real firmware. The same is done for the whole chip at its pins,
   with a separate model of the chip, while a test host drives the SPI port.
-- Mutation testing: I break the RTL on purpose in a few ways and check that the tests notice.
+- Mutation testing (`docs/mutation.md`): every one-operator or one-constant change to the RTL
+  source, 497 of them, built and run against the lockstep tests and the proofs. 477 were caught
+  at once; the 20 others showed 9 gaps in the tests, each now closed by a test that catches it,
+  and 11 changes nothing a program or the host can see, each argued.
 - Proofs with a SAT solver: the ALU against the instruction set for every input, and the LUT
   fabric configurations against what they are meant to compute.
 - Induction proofs on the generated Verilog (`formal/`, `scripts/prove.sh`): for any program,
